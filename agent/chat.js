@@ -162,6 +162,21 @@ function standardizeHistoryEntry(entry) {
 }
 
 /**
+ * Saves the current chat history to a Markdown file
+ * @param {string} filePath - Destination file path (relative or absolute)
+ */
+async function saveChatToFile(filePath) {
+    const resolvedPath = path.resolve(process.cwd(), filePath);
+    const lines = chatHistory.map(entry => {
+        const heading = entry.role === 'user' ? '## User' : '## Assistant';
+        return `${heading}\n\n${entry.content}`;
+    });
+    const markdown = lines.join('\n\n---\n\n') + '\n';
+    await fs.writeFile(resolvedPath, markdown, 'utf-8');
+    console.log(`\n✅ Chat saved to: ${resolvedPath}\n`);
+}
+
+/**
  * Displays welcome message and instructions
  */
 function displayWelcome() {
@@ -174,6 +189,7 @@ function displayWelcome() {
     console.log('  - Use @/path/to/file to insert file contents inline');
     console.log('  - Type "/exit" or "/quit" to end the session');
     console.log('  - Type "/clear" to clear chat history');
+    console.log('  - Type "/save @/path/to/file" to save chat history to a Markdown file');
     console.log('  - Type "/help" to see this message again');
     console.log('\nExamples:');
     console.log('  - "List available quantum backends"');
@@ -191,6 +207,57 @@ function displayWelcome() {
  */
 async function processInput(input) {
     const trimmed = input.trim().toLowerCase();
+
+    // Exact-case check for /save (must be before the lowercased switch)
+    if (input.trim().startsWith('/save')) {
+        if (chatHistory.length === 0) {
+            console.log('\n⚠️  Nothing to save — chat history is empty.\n');
+            return true;
+        }
+
+        // Parse optional @/path argument
+        const parts = input.trim().split(/\s+/);
+        let filePath = parts[1] && parts[1].startsWith('@')
+            ? parts[1].slice(1).trim()
+            : null;
+
+        // Prompt if no path was supplied
+        if (!filePath) {
+            filePath = await new Promise((resolve) => {
+                rl.question('\n💾 Save to file> ', (answer) => {
+                    resolve(answer.trim());
+                });
+            });
+            if (!filePath) {
+                console.log('\nSave cancelled.\n');
+                return true;
+            }
+        }
+
+        // Warn before overwriting an existing file
+        try {
+            await fs.stat(path.resolve(process.cwd(), filePath));
+            // File exists — ask for confirmation
+            const confirm = await new Promise((resolve) => {
+                rl.question('\n⚠️  File exists. Overwrite? (y/N)> ', (answer) => {
+                    resolve(answer.trim());
+                });
+            });
+            if (confirm !== 'y' && confirm !== 'Y') {
+                console.log('\nSave cancelled.\n');
+                return true;
+            }
+        } catch (_) {
+            // File does not exist — proceed
+        }
+
+        try {
+            await saveChatToFile(filePath);
+        } catch (error) {
+            console.log(`\n❌ Could not save chat: ${error.message}\n`);
+        }
+        return true;
+    }
 
     switch (trimmed) {
         case '/exit':
