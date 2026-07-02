@@ -459,16 +459,36 @@ def compare_devices(sort_by: str = "cx_error") -> str:
             "num_qubits": backend.num_qubits,
             "pending_jobs": status.pending_jobs,
             "operational": status.operational,
+            "status": "online" if status.operational else "offline",
         }
 
-        # Fetch calibration data for any mode that needs error rates
-        if sort_by in ("cx_error", "combined"):
+        # Always fetch calibration data so every device card has full fields
+        try:
             props = backend.properties()
             cx_errors = _cx_errors_for_backend(props)
             if cx_errors:
-                entry["avg_cx_error"] = round(
-                    sum(cx_errors) / len(cx_errors), 5
+                entry["avg_cx_error"] = round(sum(cx_errors) / len(cx_errors), 5)
+
+            readout_errors = [
+                props.readout_error(q)
+                for q in range(backend.num_qubits)
+                if props.readout_error(q) is not None
+            ]
+            if readout_errors:
+                entry["avg_readout_error"] = round(
+                    sum(readout_errors) / len(readout_errors), 5
                 )
+
+            t1_times = [v for q in range(backend.num_qubits)
+                        if (v := _safe_t(props.t1, q)) is not None]
+            t2_times = [v for q in range(backend.num_qubits)
+                        if (v := _safe_t(props.t2, q)) is not None]
+            if t1_times:
+                entry["avg_t1_us"] = round(sum(t1_times) / len(t1_times), 1)
+            if t2_times:
+                entry["avg_t2_us"] = round(sum(t2_times) / len(t2_times), 1)
+        except Exception:
+            pass  # calibration unavailable — leave fields absent
 
         devices.append(entry)
 
