@@ -882,14 +882,28 @@ def job_results(job_id: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"Failed to retrieve results: {e}"})
 
-    # SamplerV2 wraps results in a PrimitiveResult containing one PubResult per circuit.
-    # Each PubResult has a DataBin with one BitArray per classical register.
-    # We collect counts from every register (circuits with one register are the common case).
     try:
         pub_result = result[0]
+
+        # EstimatorV2 jobs (VQE, expectation values) return evs/stds, not bitstring counts.
+        if hasattr(pub_result.data, "evs"):
+            evs = pub_result.data.evs
+            stds = getattr(pub_result.data, "stds", None)
+            return json.dumps({
+                "job_id":           job_id,
+                "status":           "DONE",
+                "backend":          job.backend().name,
+                "type":             "estimator",
+                "expectation_value": float(evs) if hasattr(evs, "__float__") else list(evs),
+                "std_error":        float(stds) if stds is not None and hasattr(stds, "__float__") else None,
+                "note": "EstimatorV2 job — returns expectation value(s), not bitstring counts.",
+            }, indent=2)
+
+        # SamplerV2 jobs return BitArrays with bitstring counts.
         counts_by_register = {}
         for reg_name, bit_array in vars(pub_result.data).items():
             counts_by_register[reg_name] = bit_array.get_counts()
+
     except Exception as e:
         return json.dumps({
             "error": f"Failed to parse result data: {e}",
