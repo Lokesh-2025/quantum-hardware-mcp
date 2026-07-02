@@ -1054,7 +1054,7 @@ def run_grover(n_qubits: int, target_state: str) -> str:
     # Optimal number of Grover iterations for a single marked state:
     # floor(π/4 * sqrt(N)) where N = 2^n_qubits
     # n=2 → 1 iteration, n=3 → 2 iterations
-    n_iterations = max(1, round(math.pi / 4 * math.sqrt(2 ** n_qubits)))
+    n_iterations = max(1, math.floor(math.pi / 4 * math.sqrt(2 ** n_qubits)))
 
     qc = QuantumCircuit(n_qubits, n_qubits)
 
