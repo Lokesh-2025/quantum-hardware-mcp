@@ -2,8 +2,8 @@ name: Quantum Snapshot
 
 on:
   schedule:
-    # Every 6 hours: midnight, 6am, noon, 6pm UTC
-    - cron: '0 0,6,12,18 * * *'
+    # Every 2 hours (was every 6 hours)
+    - cron: '0 */2 * * *'
   # Allow a manual run from the GitHub Actions tab to test without waiting
   workflow_dispatch:
 
