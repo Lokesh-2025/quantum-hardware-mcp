@@ -257,9 +257,7 @@ def collect_braket() -> list[dict]:
             region_name=region,
         )
         # Search for all QPU devices (not simulators)
-        response = client.search_devices(
-            filters=[{"name": "deviceType", "values": ["QPU"]}]
-        )
+        response = client.search_devices(filters=[])
         devices = response.get("devices", [])
     except Exception as e:
         print(f"  [Braket] Failed to fetch devices: {e}", file=sys.stderr)
