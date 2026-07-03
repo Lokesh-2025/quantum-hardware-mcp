@@ -655,7 +655,8 @@ def device_history(device_name: str, days: int = 7) -> str:
         rows = con.execute(
             """
             SELECT ts, num_qubits, operational, pending_jobs,
-                   avg_cx_error, avg_readout_error
+                   avg_cx_error, avg_readout_error,
+                   median_t1_us, median_t2_us, qubit_yield_fraction
             FROM   device_snapshots
             WHERE  name = ?
               AND  ts >= datetime('now', ? || ' days')
@@ -666,12 +667,15 @@ def device_history(device_name: str, days: int = 7) -> str:
 
     snapshots = [
         {
-            "ts": r["ts"],
-            "num_qubits": r["num_qubits"],
-            "operational": bool(r["operational"]) if r["operational"] is not None else None,
-            "pending_jobs": r["pending_jobs"],
-            "avg_cx_error": r["avg_cx_error"],
-            "avg_readout_error": r["avg_readout_error"],
+            "ts":                  r["ts"],
+            "num_qubits":          r["num_qubits"],
+            "operational":         bool(r["operational"]) if r["operational"] is not None else None,
+            "pending_jobs":        r["pending_jobs"],
+            "avg_cx_error":        r["avg_cx_error"],
+            "avg_readout_error":   r["avg_readout_error"],
+            "median_t1_us":        r["median_t1_us"],
+            "median_t2_us":        r["median_t2_us"],
+            "qubit_yield_fraction": r["qubit_yield_fraction"],
         }
         for r in rows
     ]
@@ -2209,9 +2213,11 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
 
     Returns a list of alerts with device name, alert type, values, and timestamp.
     Alert types:
-        cx_error_spike     — 2-qubit gate error rose >20%
-        readout_error_spike — readout error rose >20%
-        went_offline        — device went from operational to offline
+        cx_error_spike              — 2-qubit gate error rose >20%
+        readout_error_spike         — readout error rose >20%
+        went_offline                — device went from operational to offline
+        t1_drop                     — median T1 coherence dropped >20% (early warning)
+        t2_drop                     — median T2 coherence dropped >20% (early warning)
     """
     import sqlite3 as _sqlite3
 
@@ -2221,34 +2227,50 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
 
     try:
         with _sqlite3.connect(db_path) as con:
+            # Stored alerts (cx/readout/offline) from snapshot.py
             query = """
                 SELECT ts, device_name, alert_type, prev_value, curr_value, pct_change
                 FROM device_alerts
                 WHERE ts >= datetime('now', ? || ' days')
             """
             params: list = [f"-{max(1, int(days))}"]
-
             if device_name:
                 query += " AND device_name = ?"
                 params.append(device_name)
-
             query += " ORDER BY ts DESC LIMIT 200"
+            stored_rows = con.execute(query, params).fetchall()
 
-            rows = con.execute(query, params).fetchall()
-
-        if not rows:
-            msg = f"No alerts in the last {days} day(s)"
+            # Live T1/T2 drop detection using LAG() window function
+            t1t2_params: list = [f"-{max(1, int(days))}"]
+            t1t2_filter = ""
             if device_name:
-                msg += f" for {device_name}"
-            return json.dumps({"alerts": [], "message": msg})
+                t1t2_filter = "AND name = ?"
+                t1t2_params.append(device_name)
+
+            t1t2_rows = con.execute(f"""
+                WITH ranked AS (
+                    SELECT name, ts, median_t1_us, median_t2_us,
+                        LAG(median_t1_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t1,
+                        LAG(median_t2_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t2
+                    FROM device_snapshots
+                    WHERE ts >= datetime('now', ? || ' days')
+                    {t1t2_filter}
+                )
+                SELECT name, ts, median_t1_us, prev_t1, median_t2_us, prev_t2
+                FROM ranked
+                WHERE prev_t1 IS NOT NULL
+                  AND (
+                    (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
+                    OR
+                    (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
+                  )
+                ORDER BY ts DESC LIMIT 100
+            """, t1t2_params).fetchall()
 
         alerts = []
-        for ts, name, alert_type, prev, curr, pct in rows:
-            entry = {
-                "ts": ts,
-                "device": name,
-                "type": alert_type,
-            }
+
+        for ts, name, alert_type, prev, curr, pct in stored_rows:
+            entry = {"ts": ts, "device": name, "type": alert_type}
             if alert_type == "went_offline":
                 entry["message"] = f"{name} went offline"
             else:
@@ -2258,6 +2280,28 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
                     f"(was {prev:.5f}, now {curr:.5f})"
                 )
             alerts.append(entry)
+
+        for name, ts, t1, prev_t1, t2, prev_t2 in t1t2_rows:
+            if prev_t1 and prev_t1 > 0 and (prev_t1 - t1) / prev_t1 > 0.20:
+                pct = round((prev_t1 - t1) / prev_t1 * 100, 1)
+                alerts.append({
+                    "ts": ts, "device": name, "type": "t1_drop",
+                    "message": f"{name} T1 dropped {pct}% (was {prev_t1:.1f}µs, now {t1:.1f}µs) — early warning of material drift",
+                })
+            if prev_t2 and prev_t2 > 0 and (prev_t2 - t2) / prev_t2 > 0.20:
+                pct = round((prev_t2 - t2) / prev_t2 * 100, 1)
+                alerts.append({
+                    "ts": ts, "device": name, "type": "t2_drop",
+                    "message": f"{name} T2 dropped {pct}% (was {prev_t2:.1f}µs, now {t2:.1f}µs) — early warning of phase decay",
+                })
+
+        alerts.sort(key=lambda a: a["ts"], reverse=True)
+
+        if not alerts:
+            msg = f"No alerts in the last {days} day(s)"
+            if device_name:
+                msg += f" for {device_name}"
+            return json.dumps({"alerts": [], "message": msg})
 
         return json.dumps({
             "alerts": alerts,
@@ -2549,6 +2593,70 @@ def _estimate_minutes(backend, qc, shots: int) -> dict:
         "execution_estimate_mins": round(exec_secs / 60, 4),
         "total_estimate_mins": total_mins,
     }
+
+
+@mcp.tool()
+def job_analytics() -> str:
+    """
+    Analyze all jobs submitted through this MCP server.
+
+    Returns a breakdown per tool showing:
+    - How many jobs were submitted
+    - Average circuit depth before and after transpilation
+    - Transpilation expansion ratio (how much the compiler inflated the circuit)
+    - Average shots requested
+
+    Useful for understanding how AI agents use quantum hardware over time.
+    This is the start of the agentic quantum workload study.
+    """
+    if not os.path.exists(DB_PATH):
+        return json.dumps({"error": "No local database found. Run snapshot.py first."})
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+                SELECT
+                    tool_name,
+                    COUNT(*) AS total_submissions,
+                    AVG(circuit_depth_raw) AS avg_raw_depth,
+                    AVG(circuit_depth_transpiled) AS avg_transpiled_depth,
+                    AVG(CAST(circuit_depth_transpiled AS REAL) /
+                        NULLIF(circuit_depth_raw, 0)) AS expansion_ratio,
+                    AVG(shots_requested) AS avg_shots
+                FROM job_submissions
+                GROUP BY tool_name
+                ORDER BY total_submissions DESC
+            """).fetchall()
+
+            total_jobs = con.execute(
+                "SELECT COUNT(*) FROM job_submissions"
+            ).fetchone()[0]
+
+        if not rows:
+            return json.dumps({
+                "total_jobs": 0,
+                "message": "No jobs logged yet. Jobs are logged when submit_job, run_grover, or run_vqe is called.",
+            })
+
+        by_tool = {}
+        for r in rows:
+            by_tool[r["tool_name"]] = {
+                "total_submissions": r["total_submissions"],
+                "avg_circuit_depth_raw": round(r["avg_raw_depth"], 1) if r["avg_raw_depth"] else None,
+                "avg_circuit_depth_transpiled": round(r["avg_transpiled_depth"], 1) if r["avg_transpiled_depth"] else None,
+                "transpilation_expansion_ratio": round(r["expansion_ratio"], 2) if r["expansion_ratio"] else None,
+                "avg_shots": round(r["avg_shots"], 0) if r["avg_shots"] else None,
+            }
+
+        return json.dumps({
+            "total_jobs_logged": total_jobs,
+            "by_tool": by_tool,
+            "note": "expansion_ratio = transpiled_depth / raw_depth — how much the compiler inflated your circuit to fit the hardware topology.",
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
