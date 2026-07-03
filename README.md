@@ -34,13 +34,13 @@ graph TD
     end
 
     subgraph Execution Plane
-        MCP["MCP Server\nserver.py\n26 tools"]
+        MCP["MCP Server\nserver.py\n27 tools"]
         IBMAPI["IBM Quantum API\nQiskit Runtime"]
         IonQAPI["IonQ REST API"]
     end
 
     subgraph Observability Plane
-        Snapshot["snapshot.py\nRuns every 6h"]
+        Snapshot["snapshot.py\nRuns every 2h"]
         DB["devices.db\nSQLite — local history"]
         CSV["data/snapshots.csv\nPublic — GitHub Actions CI"]
         Report["report.py\nDaily fleet report"]
@@ -95,7 +95,7 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 
 ### Execution plane — quantum hardware interface
 
-26 tools across IBM Quantum (22) and IonQ (4). All live in `server.py`.
+27 tools across IBM Quantum (22), IonQ (4), and analytics (1). All live in `server.py`.
 
 **IBM Quantum — device intelligence**
 
@@ -140,9 +140,10 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 
 | Tool | What it does |
 |------|-------------|
-| `get_alerts` | Calibration drift alerts — spikes >20% in CX error or readout error |
+| `get_alerts` | Calibration drift alerts — spikes >20% in CX error, readout error, T1, or T2 |
 | `start_repro_experiment` | Run the same circuit N times, record variance across runs |
 | `repro_score` | KL-divergence reproducibility score (0 = identical, 1 = maximally different) |
+| `job_analytics` | Aggregate stats on all submitted jobs — transpilation ratios, shots, by-tool breakdown |
 
 **IonQ**
 
@@ -155,9 +156,10 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 
 ### Observability plane — calibration history
 
-`snapshot.py` runs every 6 hours via GitHub Actions and a local LaunchAgent:
+`snapshot.py` runs every 2 hours via GitHub Actions and a local LaunchAgent:
 
-- Collects IBM + IonQ + AWS Braket calibration data — CX error, readout error, T1/T2, queue depth
+- Collects IBM + IonQ + AWS Braket calibration data — CX error, readout error, T1/T2, queue depth, connectivity density, qubit yield, median coherence
+- Records `day_of_week` (0=Mon…6=Sun) and `hour_utc` on every snapshot — enables Quantum Rush Hour pattern detection
 - Locally: writes to `devices.db` (SQLite) — feeds `device_history`, `device_on_date`, drift alerts
 - CI: appends to `data/snapshots.csv` — public, committed to the repo, permanent record
 
@@ -222,7 +224,7 @@ All tools operational!
 
 ```
 quantum-hardware-mcp/
-├── server.py                      # MCP server — all 26 IBM + IonQ tools
+├── server.py                      # MCP server — all 27 IBM + IonQ + analytics tools
 ├── snapshot.py                    # Multi-provider calibration snapshot agent
 ├── report.py                      # Daily fleet report
 ├── requirements.txt
@@ -282,7 +284,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. All 26 tools appear under the hammer icon.
+Restart Claude Desktop. All 27 tools appear under the hammer icon.
 
 ---
 
@@ -311,7 +313,7 @@ For sensitive research (pharmaceutical, unpublished academic work): run Ollama l
 - [x] Pascal's Triangle on real IBM hardware — 94.2% fidelity
 - [x] Singmaster's Conjecture — Grover's search — 4.11x amplification on real hardware
 - [x] VQE for H2 — chemical accuracy (0.0 mHartree) on simulator
-- [x] Multi-provider snapshot pipeline — IBM + IonQ + AWS Braket, every 6h
+- [x] Multi-provider snapshot pipeline — IBM + IonQ + AWS Braket, every 2h (upgraded from 6h)
 - [x] Full smoke test suite — 28/28 passing, zero QPU credits spent
 - [x] Listed on Glama, mcp.so, PulseMCP
 - [ ] IonQ real hardware experiments (QPU access pending)

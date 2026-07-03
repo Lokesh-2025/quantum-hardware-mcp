@@ -38,7 +38,8 @@ CSV_FIELDS = ["ts", "provider", "name", "num_qubits", "operational",
               "pending_jobs", "avg_cx_error", "avg_readout_error",
               "median_t1_us", "median_t2_us", "native_gate_set",
               "coupling_map_edges", "connectivity_density",
-              "qubit_yield_fraction", "max_shots"]
+              "qubit_yield_fraction", "max_shots",
+              "day_of_week", "hour_utc"]
 
 
 def _init_db() -> None:
@@ -60,7 +61,9 @@ def _init_db() -> None:
                 coupling_map_edges   INTEGER,
                 connectivity_density REAL,
                 qubit_yield_fraction REAL,
-                max_shots            INTEGER
+                max_shots            INTEGER,
+                day_of_week          INTEGER,  -- 0=Monday ... 6=Sunday
+                hour_utc             INTEGER   -- 0-23 UTC hour
             )
         """)
         # Add columns to existing DBs that don't have them yet
@@ -73,6 +76,8 @@ def _init_db() -> None:
             ("connectivity_density", "REAL"),
             ("qubit_yield_fraction", "REAL"),
             ("max_shots",            "INTEGER"),
+            ("day_of_week",          "INTEGER"),
+            ("hour_utc",             "INTEGER"),
         ]:
             try:
                 con.execute(f"ALTER TABLE device_snapshots ADD COLUMN {col} {typedef}")
@@ -94,7 +99,9 @@ def _init_db() -> None:
                 shots_requested          INTEGER,
                 agent_loop_iteration     INTEGER,
                 was_preflight_checked    INTEGER DEFAULT 0,
-                was_ai_corrected         INTEGER DEFAULT 0
+                was_ai_corrected         INTEGER DEFAULT 0,
+                day_of_week              INTEGER,
+                hour_utc                 INTEGER
             )
         """)
         con.execute("""
@@ -123,7 +130,10 @@ def _init_db() -> None:
 
 
 def _save_snapshots(rows: list[dict]) -> None:
-    ts = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    ts = now.isoformat()
+    day_of_week = now.weekday()   # 0=Monday, 6=Sunday
+    hour_utc    = now.hour        # 0-23
     with sqlite3.connect(DB_PATH) as con:
         con.executemany(
             """
@@ -132,8 +142,9 @@ def _save_snapshots(rows: list[dict]) -> None:
                  avg_cx_error, avg_readout_error,
                  median_t1_us, median_t2_us, native_gate_set,
                  coupling_map_edges, connectivity_density,
-                 qubit_yield_fraction, max_shots)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 qubit_yield_fraction, max_shots,
+                 day_of_week, hour_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -152,6 +163,8 @@ def _save_snapshots(rows: list[dict]) -> None:
                     r.get("connectivity_density"),
                     r.get("qubit_yield_fraction"),
                     r.get("max_shots"),
+                    day_of_week,
+                    hour_utc,
                 )
                 for r in rows
             ],
@@ -189,6 +202,8 @@ def _write_csv(rows: list[dict]) -> None:
                 "connectivity_density": r.get("connectivity_density"),
                 "qubit_yield_fraction": r.get("qubit_yield_fraction"),
                 "max_shots":            r.get("max_shots"),
+                "day_of_week":          r.get("day_of_week"),
+                "hour_utc":             r.get("hour_utc"),
             })
 
 
@@ -470,19 +485,21 @@ def log_job_submission(job_id: str, provider: str, backend_name: str,
                        was_ai_corrected: bool = False) -> None:
     """Log every job submission for the agentic workload study."""
     try:
-        ts = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
         with sqlite3.connect(DB_PATH) as con:
             con.execute("""
                 INSERT INTO job_submissions
                     (ts, job_id, provider, backend_name, tool_name,
                      circuit_qubits, circuit_depth_raw, circuit_depth_transpiled,
                      shots_requested, agent_loop_iteration,
-                     was_preflight_checked, was_ai_corrected)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (ts, job_id, provider, backend_name, tool_name,
+                     was_preflight_checked, was_ai_corrected,
+                     day_of_week, hour_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (now.isoformat(), job_id, provider, backend_name, tool_name,
                   circuit_qubits, circuit_depth_raw, circuit_depth_transpiled,
                   shots_requested, agent_loop_iteration,
-                  int(was_preflight_checked), int(was_ai_corrected)))
+                  int(was_preflight_checked), int(was_ai_corrected),
+                  now.weekday(), now.hour))
     except Exception:
         pass  # never crash the main flow over logging
 
