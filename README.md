@@ -1,6 +1,6 @@
 # Quantum Hardware MCP Server
 
-A production MCP server that gives AI assistants programmatic access to live quantum hardware — IBM Quantum and IonQ. Natural language in. Real quantum results out. No dashboards. No manual API calls.
+A production MCP server that gives AI assistants programmatic access to live quantum hardware across IBM Quantum, IonQ, and AWS Braket. Natural language in. Real quantum results out. No dashboards. No manual API calls.
 
 Built in collaboration with [Jack Woehr](https://github.com/jwoehr) — IBM Quantum veteran, Qiskit contributor.
 
@@ -16,8 +16,23 @@ Quantum researchers lose hours to operational overhead:
 - Submitting the same circuit to IBM, then separately to IonQ, then comparing by hand
 - Losing reproducibility context between runs — "what was the CX error when I ran Figure 3?"
 - No pre-flight — wasting queue time on circuits that fail at transpile
+- No cross-provider queue visibility — IBM backlogged for 3 days, IonQ open, no way to know without checking each dashboard manually
 
 This server eliminates that overhead. Your AI assistant handles device selection, circuit validation, job submission, result retrieval, and cross-provider comparison through a single interface.
+
+---
+
+## Fleet coverage
+
+19 backends across three providers:
+
+| Provider | Backends | Access |
+|----------|----------|--------|
+| IBM Quantum | 3 QPUs (ibm_torino 133q, ibm_marrakesh 156q, ibm_fez 156q) | API token |
+| IonQ | 6 (Aria, Forte, Harmony + simulators) | API key |
+| AWS Braket | 10 (QuEra Aquila 256q, IonQ via Braket, Rigetti via Braket, simulators) | IAM credentials |
+
+All 19 are polled every 2 hours. The dataset grows continuously — ML routing recommendations are planned once 60+ days of data accumulate.
 
 ---
 
@@ -28,7 +43,7 @@ graph TD
     User["User / AI Assistant"]
 
     subgraph Control Plane
-        Dispatcher["Dispatcher\nagent-server.js\nRoutes IBM vs IonQ"]
+        Dispatcher["Dispatcher\nagent-server.js\nRoutes IBM vs IonQ vs Braket"]
         IBMAgent["IBM Subagent\nibm-subagent.js"]
         IonQAgent["IonQ Subagent\nionq-subagent.js"]
     end
@@ -37,14 +52,16 @@ graph TD
         MCP["MCP Server\nserver.py\n27 tools"]
         IBMAPI["IBM Quantum API\nQiskit Runtime"]
         IonQAPI["IonQ REST API"]
+        BraketAPI["AWS Braket API"]
     end
 
     subgraph Observability Plane
         Snapshot["snapshot.py\nRuns every 2h"]
         DB["devices.db\nSQLite — local history"]
         CSV["data/snapshots.csv\nPublic — GitHub Actions CI"]
+        Jobs["job_submissions\nAgentic workload log"]
         Report["report.py\nDaily fleet report"]
-        Alerts["Calibration drift alerts\n>20% spike detection"]
+        Alerts["Calibration drift alerts\nCX / readout / T1 / T2"]
     end
 
     User --> Dispatcher
@@ -54,10 +71,13 @@ graph TD
     IonQAgent --> MCP
     MCP --> IBMAPI
     MCP --> IonQAPI
+    MCP --> BraketAPI
     Snapshot --> DB
     Snapshot --> CSV
     Snapshot --> Alerts
+    MCP --> Jobs
     DB --> MCP
+    Jobs --> MCP
     Report --> DB
 ```
 
@@ -78,7 +98,7 @@ Before touching the queue, `debug_circuit` catches missing measurements, decoher
 `submit_job` compiles to the backend's native gate set (OpenQASM 2.0 or 3.0), submits, and returns a `job_id`. `job_status` and `job_results` close the loop.
 
 **Step 5 — Observability**
-Every 6 hours, `snapshot.py` records calibration state across all providers. Drift alerts fire when any metric spikes >20%. `repro_score` runs KL-divergence across N identical runs to quantify hardware reliability.
+Every 2 hours, `snapshot.py` records calibration state across all 19 backends. Drift alerts fire when CX error, readout error, T1, or T2 spikes >20%. `repro_score` runs KL-divergence across N identical runs to quantify hardware reliability. Every job submission is logged for longitudinal workload analysis.
 
 ---
 
@@ -103,10 +123,10 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 |------|-------------|
 | `list_devices` | All accessible IBM backends with live operational status |
 | `get_device_details` | Per-qubit T1/T2, readout error, gate error, queue depth |
-| `compare_devices` | Rank by CX error, queue depth, qubit count, or combined score |
+| `compare_devices` | Rank by CX error, queue depth, qubit count, or combined score — includes avg readout error, avg T1/T2, connectivity |
 | `queue_status` | Current queue snapshot across all backends |
 | `best_qubits` | Score and rank qubits on a device by calibration quality |
-| `device_history` | Calibration snapshots for a device over the last N days |
+| `device_history` | Calibration snapshots for a device over the last N days — includes median T1/T2, qubit yield, day/hour |
 | `device_on_date` | Exact calibration state on any past date — for paper reproducibility |
 
 **IBM Quantum — job lifecycle**
@@ -115,7 +135,7 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 |------|-------------|
 | `submit_job` | Transpile and submit OpenQASM 2.0 or 3.0 — returns `job_id` |
 | `job_status` | QUEUED / RUNNING / DONE / ERROR |
-| `job_results` | Bit-string measurement counts from a completed job |
+| `job_results` | Bit-string measurement counts (Sampler) or expectation values (Estimator) from a completed job |
 | `cancel_job` | Cancel a queued or running job |
 | `list_jobs` | Recent jobs with status, backend, and timestamps |
 
@@ -132,7 +152,7 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 
 | Tool | What it does |
 |------|-------------|
-| `run_grover` | Full Grover's search — builds oracle + diffusion, picks least-busy backend, submits |
+| `run_grover` | Full Grover's search — builds oracle + diffusion operator, picks least-busy backend, submits |
 | `run_vqe` | Variational Quantum Eigensolver — H2 ground state to chemical accuracy (0.0 mHartree) in ~60 iterations |
 | `estimate_expectation` | Estimator primitive: computes ⟨ψ\|O\|ψ⟩ for Pauli observables (VQE, QAOA, quantum chemistry) |
 
@@ -140,10 +160,10 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 
 | Tool | What it does |
 |------|-------------|
-| `get_alerts` | Calibration drift alerts — spikes >20% in CX error, readout error, T1, or T2 |
+| `get_alerts` | Calibration drift alerts — spikes >20% in CX error, readout error, T1, or T2 (T1/T2 use SQL LAG window function) |
 | `start_repro_experiment` | Run the same circuit N times, record variance across runs |
 | `repro_score` | KL-divergence reproducibility score (0 = identical, 1 = maximally different) |
-| `job_analytics` | Aggregate stats on all submitted jobs — transpilation ratios, shots, by-tool breakdown |
+| `job_analytics` | Aggregate stats across all logged jobs — transpilation expansion ratios, average shots, per-tool breakdown |
 
 **IonQ**
 
@@ -156,12 +176,37 @@ Every 6 hours, `snapshot.py` records calibration state across all providers. Dri
 
 ### Observability plane — calibration history
 
-`snapshot.py` runs every 2 hours via GitHub Actions and a local LaunchAgent:
+`snapshot.py` runs every 2 hours via GitHub Actions (was 6h — upgraded for higher-resolution Rush Hour detection):
 
-- Collects IBM + IonQ + AWS Braket calibration data — CX error, readout error, T1/T2, queue depth, connectivity density, qubit yield, median coherence
-- Records `day_of_week` (0=Mon…6=Sun) and `hour_utc` on every snapshot — enables Quantum Rush Hour pattern detection
-- Locally: writes to `devices.db` (SQLite) — feeds `device_history`, `device_on_date`, drift alerts
-- CI: appends to `data/snapshots.csv` — public, committed to the repo, permanent record
+**Per-snapshot fields collected:**
+
+| Field | Why it matters |
+|-------|---------------|
+| `avg_cx_error` | Primary gate quality metric |
+| `avg_readout_error` | State-preparation and measurement overhead |
+| `median_t1_us` | Median coherence time — median is robust to one outlier qubit skewing the average |
+| `median_t2_us` | Dephasing time — degrades faster than T1 under environmental noise |
+| `qubit_yield_fraction` | Fraction of qubits with usable T1/T2 — a device with 90/133 working qubits is different from 133/133 |
+| `connectivity_density` | Edges / max-possible-edges — IBM heavy-hex ~0.015 vs IonQ all-to-all = 1.0 |
+| `gate_set_size` | Number of native gates — affects transpilation depth |
+| `max_circuit_depth` | Hard limit before decoherence kills the result |
+| `native_2q_gate` | CX vs ECR vs ZZ — matters for circuit rewriting |
+| `day_of_week` | 0=Monday … 6=Sunday — for weekly seasonality modeling |
+| `hour_utc` | 0–23 — for time-of-day queue pattern detection |
+
+**Job submissions table** — every call to `submit_job`, `run_grover`, or `run_vqe` writes a row to `job_submissions`:
+
+```
+job_id · provider · backend · tool · circuit_qubits · circuit_depth_raw
+circuit_depth_transpiled · shots · agent_loop_iteration
+was_preflight_checked · was_ai_corrected · day_of_week · hour_utc
+```
+
+This is the foundation for a first-of-its-kind agentic quantum workload study — once the dataset matures we can answer: which backends see the most AI-driven traffic, what is the typical transpilation expansion ratio by provider, how does shot count correlate with circuit depth.
+
+**Storage:**
+- `devices.db` (SQLite, local) — feeds `device_history`, `device_on_date`, drift alerts, `job_analytics`
+- `data/snapshots.csv` (public, committed by CI) — permanent append-only calibration record
 
 `report.py` generates a daily fleet summary at 8am — error trends, device rankings, alert history.
 
@@ -179,16 +224,18 @@ Binary-encode Pascal's Triangle values as quantum states, measure preparation fi
 | C(10,5) = 252 → `\|11111100⟩` | 903/1024 — **88.1%** | — |
 | C(15,5) = 3003 → 12-bit state | 837/1024 — **81.7%** | — |
 
-### Singmaster's Conjecture — Grover's search — IBM ibm\_kingston
+### Singmaster's Conjecture — Grover's search — IBM ibm\_marrakesh
 
 Singmaster's Conjecture asks whether any integer appears 9+ times in Pascal's Triangle. We use Grover's search to amplify rows containing a target value above the noise floor.
 
-| Experiment | Target | Marked rows | Amplification | Circuit depth | Result |
-|------------|--------|-------------|---------------|---------------|--------|
-| Phase 1 | 6 | rows 4, 6 | **4.11x** | 611 | ✅ |
-| Phase 2 | 3003 | rows 14, 15 | **3.0x** | 772 | ✅ |
+| Experiment | Target | Marked rows | Raw depth | Transpiled depth | Amplification | Interpretation |
+|------------|--------|-------------|-----------|-----------------|---------------|----------------|
+| Phase 1 | 6 | rows 4, 6 | — | 611 | **4.11×** | Signal clear above noise |
+| Phase 2 | 3003 | rows 14, 15 | 101 | 16,271 (161× expansion) | **1.04×** | Noise floor — hardware coherence limit reached |
 
-Amplification degrades predictably with circuit depth — itself a useful noise characterization. Full code and raw results: [singmasters-conjecture](https://github.com/Lokesh-2025/singmasters-conjecture) (collaboration with [Jack Woehr](https://github.com/jwoehr)).
+Phase 2 is not a failure — it **brackets the coherence limit of ibm_marrakesh** between 611 and 16,271 transpiled gates. The 161× transpilation expansion ratio (101 raw gates → 16,271 after routing and basis translation) is itself a hardware characterization result: IBM heavy-hex topology forces gate decompositions that blow up shallow circuits. This number belongs in the paper.
+
+Full code and raw results: [singmasters-conjecture](https://github.com/Lokesh-2025/singmasters-conjecture) (collaboration with [Jack Woehr](https://github.com/jwoehr)).
 
 ### VQE — H2 molecule ground state energy
 
@@ -211,7 +258,7 @@ This is a stepping stone toward receptor-ligand binding energy simulations for d
 python tests/test_all_tools.py
 ```
 
-28 checks across all 26 tools. Read-only tools hit the real IBM and IonQ APIs. Write tools are tested against validation paths only — zero QPU credits spent.
+28 checks across all 27 tools. Read-only tools hit the real IBM and IonQ APIs. Write tools are tested against validation paths only — zero QPU credits spent.
 
 ```
 Total: 28 checks | ✅ 28 passed | ❌ 0 failed | ⏭️  0 skipped
@@ -225,7 +272,7 @@ All tools operational!
 ```
 quantum-hardware-mcp/
 ├── server.py                      # MCP server — all 27 IBM + IonQ + analytics tools
-├── snapshot.py                    # Multi-provider calibration snapshot agent
+├── snapshot.py                    # Multi-provider calibration snapshot agent (every 2h)
 ├── report.py                      # Daily fleet report
 ├── requirements.txt
 ├── docker-compose.yml
@@ -239,15 +286,15 @@ quantum-hardware-mcp/
 │   │   ├── ibm-subagent.js        # IBM specialist
 │   │   └── ionq-subagent.js       # IonQ specialist
 ├── experiments/
-│   ├── singmasters_grover.py      # Grover's search for Singmaster's Conjecture
-│   ├── singmasters_3003.py        # Phase 2 — 3003 in Pascal's Triangle
+│   ├── singmasters_grover.py      # Grover's search — Phase 1 (target: 6)
+│   ├── singmasters_3003.py        # Grover's search — Phase 2 (target: 3003, coherence limit)
 │   └── vqe_h2.py                  # VQE for H2 molecule ground state
 ├── tests/
 │   └── test_all_tools.py          # 28-check smoke test suite
 ├── data/
-│   └── snapshots.csv              # Public calibration history (updated by CI)
+│   └── snapshots.csv              # Public calibration history (updated by CI every 2h)
 └── .github/workflows/
-    └── snapshot.yml               # GitHub Actions: snapshot every 6h
+    └── snapshot.yml               # GitHub Actions: snapshot every 2h
 ```
 
 ---
@@ -298,7 +345,7 @@ Restart Claude Desktop. All 27 tools appear under the hammer icon.
 | Ollama | Free, local | `LLM_PROVIDER=ollama` + `OLLAMA_MODEL` |
 | vLLM | Self-hosted | `LLM_PROVIDER=vllm` + `VLLM_BASE_URL` |
 
-For sensitive research (pharmaceutical, unpublished academic work): run Ollama locally. The LLM never leaves your machine. The MCP server only contacts IBM/IonQ when you explicitly submit a job.
+For sensitive research (pharmaceutical, unpublished academic work): run Ollama locally. The LLM never leaves your machine. The MCP server only contacts IBM/IonQ/Braket when you explicitly submit a job.
 
 ---
 
@@ -306,22 +353,29 @@ For sensitive research (pharmaceutical, unpublished academic work): run Ollama l
 
 - [x] IBM Quantum tools — device intelligence, job lifecycle, pre-flight, routing
 - [x] IonQ support — devices, submit, status, results
+- [x] AWS Braket integration — 10 backends added to snapshot pipeline
 - [x] Multi-agent control plane — dispatcher + IBM/IonQ specialist subagents
-- [x] Calibration drift alerts — auto-detects >20% error spikes
+- [x] Calibration drift alerts — CX error, readout error, T1, T2 (LAG window detection)
 - [x] Reproducibility scoring — KL-divergence across N runs
 - [x] Credit-aware routing — QPU cost estimation before submit
-- [x] Pascal's Triangle on real IBM hardware — 94.2% fidelity
-- [x] Singmaster's Conjecture — Grover's search — 4.11x amplification on real hardware
+- [x] Pascal's Triangle on real IBM hardware — 94.2% fidelity at C(6,3)
+- [x] Singmaster's Conjecture Phase 1 — Grover's search — 4.11× amplification (depth 611)
+- [x] Singmaster's Conjecture Phase 2 — coherence limit bracketed at depth 16,271 on ibm_marrakesh
 - [x] VQE for H2 — chemical accuracy (0.0 mHartree) on simulator
 - [x] Multi-provider snapshot pipeline — IBM + IonQ + AWS Braket, every 2h (upgraded from 6h)
+- [x] Extended calibration fields — 11 fields per snapshot including median T1/T2, qubit yield, connectivity density
+- [x] Temporal indexing — day_of_week + hour_utc on every snapshot and job submission
+- [x] Job submissions table — agentic workload tracking with transpilation expansion ratios
+- [x] job_analytics tool — aggregate workload stats across all submitted jobs
 - [x] Full smoke test suite — 28/28 passing, zero QPU credits spent
 - [x] Listed on Glama, mcp.so, PulseMCP
 - [ ] IonQ real hardware experiments (QPU access pending)
 - [ ] VQE on real IBM hardware — H2 hardware result
 - [ ] Circuit fingerprinting — cache results, skip resubmitting identical circuits
+- [ ] Quantum Rush Hour detection — weekly queue seasonality via STL decomposition (needs 60+ days of data)
 - [ ] Smart routing brain — cross-provider ML recommendations (needs 60+ days of data)
 - [ ] Autonomous daily report agent
-- [ ] Circuit image understanding — accept a circuit diagram image as input, interpret and submit (inspired by [quantum-assistant](https://github.com/samuellimabraz/quantum-assistant) which fine-tunes VLMs on quantum visuals) — **ask Jack on Monday**
+- [ ] Circuit image understanding — accept a circuit diagram image as input, interpret and submit
 
 ---
 
