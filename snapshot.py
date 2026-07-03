@@ -19,6 +19,7 @@ import sys
 import csv
 import json
 import sqlite3
+import statistics
 import requests
 from datetime import datetime, timezone
 
@@ -34,29 +35,72 @@ DB_PATH   = os.path.join(BASE_DIR, "devices.db")
 CSV_PATH  = os.path.join(BASE_DIR, "data", "snapshots.csv")
 
 CSV_FIELDS = ["ts", "provider", "name", "num_qubits", "operational",
-              "pending_jobs", "avg_cx_error", "avg_readout_error"]
+              "pending_jobs", "avg_cx_error", "avg_readout_error",
+              "median_t1_us", "median_t2_us", "native_gate_set",
+              "coupling_map_edges", "connectivity_density",
+              "qubit_yield_fraction", "max_shots"]
 
 
 def _init_db() -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS device_snapshots (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts                TEXT    NOT NULL,
-                provider          TEXT    NOT NULL DEFAULT 'ibm',
-                name              TEXT    NOT NULL,
-                num_qubits        INTEGER,
-                operational       INTEGER,
-                pending_jobs      INTEGER,
-                avg_cx_error      REAL,
-                avg_readout_error REAL
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                   TEXT    NOT NULL,
+                provider             TEXT    NOT NULL DEFAULT 'ibm',
+                name                 TEXT    NOT NULL,
+                num_qubits           INTEGER,
+                operational          INTEGER,
+                pending_jobs         INTEGER,
+                avg_cx_error         REAL,
+                avg_readout_error    REAL,
+                median_t1_us         REAL,
+                median_t2_us         REAL,
+                native_gate_set      TEXT,
+                coupling_map_edges   INTEGER,
+                connectivity_density REAL,
+                qubit_yield_fraction REAL,
+                max_shots            INTEGER
             )
         """)
-        # Add provider column to existing DBs that don't have it yet
-        try:
-            con.execute("ALTER TABLE device_snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'ibm'")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Add columns to existing DBs that don't have them yet
+        for col, typedef in [
+            ("provider",             "TEXT NOT NULL DEFAULT 'ibm'"),
+            ("median_t1_us",         "REAL"),
+            ("median_t2_us",         "REAL"),
+            ("native_gate_set",      "TEXT"),
+            ("coupling_map_edges",   "INTEGER"),
+            ("connectivity_density", "REAL"),
+            ("qubit_yield_fraction", "REAL"),
+            ("max_shots",            "INTEGER"),
+        ]:
+            try:
+                con.execute(f"ALTER TABLE device_snapshots ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # job_submissions — tracks every job sent through the MCP server
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS job_submissions (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                       TEXT NOT NULL,
+                job_id                   TEXT,
+                provider                 TEXT,
+                backend_name             TEXT,
+                tool_name                TEXT,
+                circuit_qubits           INTEGER,
+                circuit_depth_raw        INTEGER,
+                circuit_depth_transpiled INTEGER,
+                shots_requested          INTEGER,
+                agent_loop_iteration     INTEGER,
+                was_preflight_checked    INTEGER DEFAULT 0,
+                was_ai_corrected         INTEGER DEFAULT 0
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_job_submissions_ts
+            ON job_submissions (ts)
+        """)
         con.execute("""
             CREATE INDEX IF NOT EXISTS idx_name_ts
             ON device_snapshots (name, ts)
@@ -85,8 +129,11 @@ def _save_snapshots(rows: list[dict]) -> None:
             """
             INSERT INTO device_snapshots
                 (ts, provider, name, num_qubits, operational, pending_jobs,
-                 avg_cx_error, avg_readout_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 avg_cx_error, avg_readout_error,
+                 median_t1_us, median_t2_us, native_gate_set,
+                 coupling_map_edges, connectivity_density,
+                 qubit_yield_fraction, max_shots)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -98,6 +145,13 @@ def _save_snapshots(rows: list[dict]) -> None:
                     r.get("pending_jobs"),
                     r.get("avg_cx_error"),
                     r.get("avg_readout_error"),
+                    r.get("median_t1_us"),
+                    r.get("median_t2_us"),
+                    r.get("native_gate_set"),
+                    r.get("coupling_map_edges"),
+                    r.get("connectivity_density"),
+                    r.get("qubit_yield_fraction"),
+                    r.get("max_shots"),
                 )
                 for r in rows
             ],
@@ -120,14 +174,21 @@ def _write_csv(rows: list[dict]) -> None:
             writer.writeheader()
         for r in rows:
             writer.writerow({
-                "ts":               ts,
-                "provider":         r.get("provider", "ibm"),
-                "name":             r["name"],
-                "num_qubits":       r.get("num_qubits"),
-                "operational":      r.get("operational"),
-                "pending_jobs":     r.get("pending_jobs"),
-                "avg_cx_error":     r.get("avg_cx_error"),
-                "avg_readout_error": r.get("avg_readout_error"),
+                "ts":                   ts,
+                "provider":             r.get("provider", "ibm"),
+                "name":                 r["name"],
+                "num_qubits":           r.get("num_qubits"),
+                "operational":          r.get("operational"),
+                "pending_jobs":         r.get("pending_jobs"),
+                "avg_cx_error":         r.get("avg_cx_error"),
+                "avg_readout_error":    r.get("avg_readout_error"),
+                "median_t1_us":         r.get("median_t1_us"),
+                "median_t2_us":         r.get("median_t2_us"),
+                "native_gate_set":      r.get("native_gate_set"),
+                "coupling_map_edges":   r.get("coupling_map_edges"),
+                "connectivity_density": r.get("connectivity_density"),
+                "qubit_yield_fraction": r.get("qubit_yield_fraction"),
+                "max_shots":            r.get("max_shots"),
             })
 
 
@@ -342,10 +403,88 @@ def collect_ibm() -> list[dict]:
             ]
             if readout:
                 row["avg_readout_error"] = round(sum(readout) / len(readout), 5)
+
+            # T1/T2 medians (in microseconds) — some qubits may lack data
+            t1_vals, t2_vals = [], []
+            for q in range(backend.num_qubits):
+                try:
+                    v = props.t1(q)
+                    if v is not None:
+                        t1_vals.append(v * 1e6)
+                except Exception:
+                    pass
+                try:
+                    v = props.t2(q)
+                    if v is not None:
+                        t2_vals.append(v * 1e6)
+                except Exception:
+                    pass
+            if t1_vals:
+                row["median_t1_us"] = round(statistics.median(t1_vals), 1)
+            if t2_vals:
+                row["median_t2_us"] = round(statistics.median(t2_vals), 1)
+
+            # Qubit yield — fraction with valid T1 calibration
+            row["qubit_yield_fraction"] = round(len(t1_vals) / backend.num_qubits, 3)
+
+        # Native gate set
+        try:
+            row["native_gate_set"] = ",".join(sorted(backend.operation_names))
+        except Exception:
+            pass
+
+        # Coupling map topology
+        try:
+            cm = backend.coupling_map
+            if cm is not None:
+                edges = len(list(cm.get_edges()))
+                n = backend.num_qubits
+                row["coupling_map_edges"] = edges
+                row["connectivity_density"] = round(
+                    edges / (n * (n - 1)), 4) if n > 1 else 0
+        except Exception:
+            pass
+
+        # Max shots per job
+        try:
+            row["max_shots"] = backend.max_shots
+        except Exception:
+            try:
+                row["max_shots"] = backend.configuration().max_shots
+            except Exception:
+                pass
+
         rows.append(row)
 
     print(f"  [IBM] Collected {len(rows)} backends")
     return rows
+
+
+def log_job_submission(job_id: str, provider: str, backend_name: str,
+                       tool_name: str, circuit_qubits: int = None,
+                       circuit_depth_raw: int = None,
+                       circuit_depth_transpiled: int = None,
+                       shots_requested: int = None,
+                       agent_loop_iteration: int = None,
+                       was_preflight_checked: bool = False,
+                       was_ai_corrected: bool = False) -> None:
+    """Log every job submission for the agentic workload study."""
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("""
+                INSERT INTO job_submissions
+                    (ts, job_id, provider, backend_name, tool_name,
+                     circuit_qubits, circuit_depth_raw, circuit_depth_transpiled,
+                     shots_requested, agent_loop_iteration,
+                     was_preflight_checked, was_ai_corrected)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ts, job_id, provider, backend_name, tool_name,
+                  circuit_qubits, circuit_depth_raw, circuit_depth_transpiled,
+                  shots_requested, agent_loop_iteration,
+                  int(was_preflight_checked), int(was_ai_corrected)))
+    except Exception:
+        pass  # never crash the main flow over logging
 
 
 def collect() -> None:

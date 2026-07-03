@@ -37,6 +37,8 @@ import math
 import sqlite3
 import argparse
 import anyio
+import contextvars
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -49,6 +51,7 @@ from qiskit_ibm_runtime import EstimatorV2 as Estimator
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+import snapshot as _snapshot
 from qiskit_ibm_runtime import QiskitRuntimeService
 from starlette.responses import JSONResponse as _JSONResponse
 from starlette.responses import JSONResponse
@@ -158,15 +161,38 @@ _init_db()
 # Helper: connect to IBM Quantum
 # --------------------------------------------------------------------------
 
+# Lets api.py run a request with a caller-supplied IBM token instead of the
+# shared IBM_QUANTUM_TOKEN in .env ("bring your own key"), without changing
+# any tool function's signature (so the MCP contract Claude Desktop sees is
+# untouched) and without the concurrency hazard of mutating os.environ — a
+# ContextVar is isolated per request/thread, so two requests running at the
+# same time never see each other's token.
+_token_override = contextvars.ContextVar("token_override", default=None)
+
+
+@contextmanager
+def use_ibm_token(token: str | None):
+    """Temporarily make _get_service() use `token` instead of the .env default."""
+    if not token:
+        yield
+        return
+    reset = _token_override.set(token)
+    try:
+        yield
+    finally:
+        _token_override.reset(reset)
+
+
 def _get_service() -> QiskitRuntimeService:
     """
-    Build a QiskitRuntimeService from env vars.
+    Build a QiskitRuntimeService from a per-request token override (see
+    use_ibm_token) or, failing that, env vars.
 
-    Required: IBM_QUANTUM_TOKEN
+    Required: IBM_QUANTUM_TOKEN (unless a per-request token override is active)
     Optional: IBM_CHANNEL  (default: ibm_quantum_platform)
               IBM_INSTANCE (e.g. ibm-q/open/main — falls back to IBM auto-select)
     """
-    token = os.getenv("IBM_QUANTUM_TOKEN")
+    token = _token_override.get() or os.getenv("IBM_QUANTUM_TOKEN")
     if not token:
         raise ValueError(
             "IBM_QUANTUM_TOKEN is not set. "
@@ -789,6 +815,15 @@ def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
     sampler = Sampler(mode=backend)
     job = sampler.run([isa_circuit], shots=shots)
 
+    _snapshot.log_job_submission(
+        job_id=job.job_id(), provider="ibm", backend_name=device_name,
+        tool_name="submit_job",
+        circuit_qubits=circuit.num_qubits,
+        circuit_depth_raw=circuit.depth(),
+        circuit_depth_transpiled=isa_circuit.depth(),
+        shots_requested=shots,
+    )
+
     return json.dumps({
         "job_id": job.job_id(),
         "status": str(job.status()),
@@ -1156,6 +1191,15 @@ def run_grover(n_qubits: int, target_state: str) -> str:
     sampler = Sampler(mode=best_backend)
     job = sampler.run([isa_circuit], shots=1024)
 
+    _snapshot.log_job_submission(
+        job_id=job.job_id(), provider="ibm", backend_name=best_backend.name,
+        tool_name="run_grover",
+        circuit_qubits=n_qubits,
+        circuit_depth_raw=qc.depth(),
+        circuit_depth_transpiled=isa_circuit.depth(),
+        shots_requested=1024,
+    )
+
     # Theoretical success probability after optimal iterations
     # P = sin²((2k+1) * arcsin(1/sqrt(N))) where k = n_iterations
     theta = math.asin(1 / math.sqrt(2 ** n_qubits))
@@ -1342,6 +1386,14 @@ def run_vqe(molecule: str = "H2", backend_name: str = "simulator",
         job = hw_estimator.run([(isa_circuit, isa_hamiltonian)])
     except Exception as e:
         return json.dumps({"error": f"IBM hardware submission failed: {e}"})
+
+    _snapshot.log_job_submission(
+        job_id=job.job_id(), provider="ibm", backend_name=backend_name,
+        tool_name="run_vqe",
+        circuit_qubits=qc.num_qubits,
+        circuit_depth_raw=qc.depth(),
+        circuit_depth_transpiled=isa_circuit.depth(),
+    )
 
     return json.dumps({
         "molecule": mol,
