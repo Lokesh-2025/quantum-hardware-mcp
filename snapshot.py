@@ -39,7 +39,14 @@ CSV_FIELDS = ["ts", "provider", "name", "num_qubits", "operational",
               "median_t1_us", "median_t2_us", "native_gate_set",
               "coupling_map_edges", "connectivity_density",
               "qubit_yield_fraction", "max_shots",
-              "day_of_week", "hour_utc"]
+              "day_of_week", "hour_utc",
+              # BackendV2 extended fields
+              "processor_family", "backend_version", "online_date",
+              "last_calibration_dt", "dt_ns", "avg_2q_gate_duration_ns",
+              "avg_readout_length_ns", "avg_prob_meas0_prep1",
+              "avg_prob_meas1_prep0", "rep_delay_default_ms",
+              # _data hidden fields (Jack's tip)
+              "clops_h", "max_experiments", "quantum_volume"]
 
 
 def _init_db() -> None:
@@ -62,22 +69,49 @@ def _init_db() -> None:
                 connectivity_density REAL,
                 qubit_yield_fraction REAL,
                 max_shots            INTEGER,
-                day_of_week          INTEGER,  -- 0=Monday ... 6=Sunday
-                hour_utc             INTEGER   -- 0-23 UTC hour
+                day_of_week              INTEGER,  -- 0=Monday ... 6=Sunday
+                hour_utc                 INTEGER,  -- 0-23 UTC hour
+                -- BackendV2 extended fields (Jack's tip: fields within fields)
+                processor_family         TEXT,     -- e.g. "Heron r2", "Eagle r3"
+                backend_version          TEXT,     -- firmware version e.g. "1.0.21"
+                online_date              TEXT,     -- ISO date device came online
+                last_calibration_dt      TEXT,     -- ISO datetime of last IBM recalibration
+                dt_ns                    REAL,     -- system clock resolution in nanoseconds
+                avg_2q_gate_duration_ns  REAL,     -- average 2Q gate duration
+                avg_readout_length_ns    REAL,     -- average measurement duration
+                avg_prob_meas0_prep1     REAL,     -- avg asymmetric readout error 0→1
+                avg_prob_meas1_prep0     REAL,     -- avg asymmetric readout error 1→0
+                rep_delay_default_ms     REAL,     -- default delay between shots (ms)
+                clops_h                  INTEGER,  -- IBM CLOPS benchmark (speed metric)
+                max_experiments          INTEGER,  -- max circuits per batch job
+                quantum_volume           INTEGER   -- IBM QV benchmark (NULL for Heron)
             )
         """)
         # Add columns to existing DBs that don't have them yet
         for col, typedef in [
-            ("provider",             "TEXT NOT NULL DEFAULT 'ibm'"),
-            ("median_t1_us",         "REAL"),
-            ("median_t2_us",         "REAL"),
-            ("native_gate_set",      "TEXT"),
-            ("coupling_map_edges",   "INTEGER"),
-            ("connectivity_density", "REAL"),
-            ("qubit_yield_fraction", "REAL"),
-            ("max_shots",            "INTEGER"),
-            ("day_of_week",          "INTEGER"),
-            ("hour_utc",             "INTEGER"),
+            ("provider",                "TEXT NOT NULL DEFAULT 'ibm'"),
+            ("median_t1_us",            "REAL"),
+            ("median_t2_us",            "REAL"),
+            ("native_gate_set",         "TEXT"),
+            ("coupling_map_edges",      "INTEGER"),
+            ("connectivity_density",    "REAL"),
+            ("qubit_yield_fraction",    "REAL"),
+            ("max_shots",               "INTEGER"),
+            ("day_of_week",             "INTEGER"),
+            ("hour_utc",                "INTEGER"),
+            ("processor_family",        "TEXT"),
+            ("backend_version",         "TEXT"),
+            ("online_date",             "TEXT"),
+            ("last_calibration_dt",     "TEXT"),
+            ("dt_ns",                   "REAL"),
+            ("avg_2q_gate_duration_ns", "REAL"),
+            ("avg_readout_length_ns",   "REAL"),
+            ("avg_prob_meas0_prep1",    "REAL"),
+            ("avg_prob_meas1_prep0",    "REAL"),
+            ("rep_delay_default_ms",    "REAL"),
+            ("clops_h",                 "INTEGER"),
+            ("max_experiments",         "INTEGER"),
+            ("quantum_volume",          "INTEGER"),
         ]:
             try:
                 con.execute(f"ALTER TABLE device_snapshots ADD COLUMN {col} {typedef}")
@@ -143,8 +177,14 @@ def _save_snapshots(rows: list[dict]) -> None:
                  median_t1_us, median_t2_us, native_gate_set,
                  coupling_map_edges, connectivity_density,
                  qubit_yield_fraction, max_shots,
-                 day_of_week, hour_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 day_of_week, hour_utc,
+                 processor_family, backend_version, online_date,
+                 last_calibration_dt, dt_ns, avg_2q_gate_duration_ns,
+                 avg_readout_length_ns, avg_prob_meas0_prep1,
+                 avg_prob_meas1_prep0, rep_delay_default_ms,
+                 clops_h, max_experiments, quantum_volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -165,6 +205,19 @@ def _save_snapshots(rows: list[dict]) -> None:
                     r.get("max_shots"),
                     day_of_week,
                     hour_utc,
+                    r.get("processor_family"),
+                    r.get("backend_version"),
+                    r.get("online_date"),
+                    r.get("last_calibration_dt"),
+                    r.get("dt_ns"),
+                    r.get("avg_2q_gate_duration_ns"),
+                    r.get("avg_readout_length_ns"),
+                    r.get("avg_prob_meas0_prep1"),
+                    r.get("avg_prob_meas1_prep0"),
+                    r.get("rep_delay_default_ms"),
+                    r.get("clops_h"),
+                    r.get("max_experiments"),
+                    r.get("quantum_volume"),
                 )
                 for r in rows
             ],
@@ -197,13 +250,26 @@ def _write_csv(rows: list[dict]) -> None:
                 "avg_readout_error":    r.get("avg_readout_error"),
                 "median_t1_us":         r.get("median_t1_us"),
                 "median_t2_us":         r.get("median_t2_us"),
-                "native_gate_set":      r.get("native_gate_set"),
-                "coupling_map_edges":   r.get("coupling_map_edges"),
-                "connectivity_density": r.get("connectivity_density"),
-                "qubit_yield_fraction": r.get("qubit_yield_fraction"),
-                "max_shots":            r.get("max_shots"),
-                "day_of_week":          r.get("day_of_week"),
-                "hour_utc":             r.get("hour_utc"),
+                "native_gate_set":          r.get("native_gate_set"),
+                "coupling_map_edges":       r.get("coupling_map_edges"),
+                "connectivity_density":     r.get("connectivity_density"),
+                "qubit_yield_fraction":     r.get("qubit_yield_fraction"),
+                "max_shots":                r.get("max_shots"),
+                "day_of_week":              r.get("day_of_week"),
+                "hour_utc":                 r.get("hour_utc"),
+                "processor_family":         r.get("processor_family"),
+                "backend_version":          r.get("backend_version"),
+                "online_date":              r.get("online_date"),
+                "last_calibration_dt":      r.get("last_calibration_dt"),
+                "dt_ns":                    r.get("dt_ns"),
+                "avg_2q_gate_duration_ns":  r.get("avg_2q_gate_duration_ns"),
+                "avg_readout_length_ns":    r.get("avg_readout_length_ns"),
+                "avg_prob_meas0_prep1":     r.get("avg_prob_meas0_prep1"),
+                "avg_prob_meas1_prep0":     r.get("avg_prob_meas1_prep0"),
+                "rep_delay_default_ms":     r.get("rep_delay_default_ms"),
+                "clops_h":                  r.get("clops_h"),
+                "max_experiments":          r.get("max_experiments"),
+                "quantum_volume":           r.get("quantum_volume"),
             })
 
 
@@ -460,12 +526,95 @@ def collect_ibm() -> list[dict]:
         except Exception:
             pass
 
-        # Max shots per job
+        # ── BackendV2 extended fields (Jack's tip: look deeply, fields within fields) ──
+
+        # Processor family (Heron r2, Eagle r3, Falcon r8 etc.)
         try:
-            row["max_shots"] = backend.max_shots
+            pt = backend.processor_type
+            row["processor_family"] = f"{pt['family']} r{pt.get('revision', '')}"
         except Exception:
+            pass
+
+        # Firmware version
+        try:
+            row["backend_version"] = backend.backend_version
+        except Exception:
+            pass
+
+        # Date device came online
+        try:
+            od = backend.online_date
+            row["online_date"] = od.isoformat() if od else None
+        except Exception:
+            pass
+
+        # Last IBM recalibration timestamp
+        try:
+            lud = props.last_update_date if props else None
+            row["last_calibration_dt"] = lud.isoformat() if lud else None
+        except Exception:
+            pass
+
+        # System clock resolution in nanoseconds
+        try:
+            row["dt_ns"] = round(backend.dt * 1e9, 3)
+        except Exception:
+            pass
+
+        # Average 2Q gate duration from target (nanoseconds)
+        try:
+            target = backend.target
+            durations = []
+            for op in target.operation_names:
+                for qargs, pt in (target[op] or {}).items():
+                    if pt and pt.duration and len(qargs) == 2:
+                        durations.append(pt.duration * 1e9)
+            if durations:
+                row["avg_2q_gate_duration_ns"] = round(
+                    sum(durations) / len(durations), 1)
+        except Exception:
+            pass
+
+        # Readout length + asymmetric readout errors from qubit properties
+        try:
+            readout_lengths, prob01, prob10 = [], [], []
+            for q in range(backend.num_qubits):
+                for item in props.qubits[q]:
+                    if item.name == "readout_length" and item.value is not None:
+                        readout_lengths.append(item.value)   # already in ns
+                    elif item.name == "prob_meas0_prep1" and item.value is not None:
+                        prob01.append(item.value)
+                    elif item.name == "prob_meas1_prep0" and item.value is not None:
+                        prob10.append(item.value)
+            if readout_lengths:
+                row["avg_readout_length_ns"] = round(
+                    sum(readout_lengths) / len(readout_lengths), 1)
+            if prob01:
+                row["avg_prob_meas0_prep1"] = round(
+                    sum(prob01) / len(prob01), 6)
+            if prob10:
+                row["avg_prob_meas1_prep0"] = round(
+                    sum(prob10) / len(prob10), 6)
+        except Exception:
+            pass
+
+        # Default rep delay in ms
+        try:
+            row["rep_delay_default_ms"] = round(backend.default_rep_delay * 1000, 4)
+        except Exception:
+            pass
+
+        # Hidden _data fields (Jack: "fields within fields")
+        try:
+            d = backend._data
+            row["max_shots"]      = d.get("max_shots")
+            row["clops_h"]        = d.get("clops_h")
+            row["max_experiments"] = d.get("max_experiments")
+            row["quantum_volume"] = d.get("quantum_volume")
+        except Exception:
+            # fallback for max_shots
             try:
-                row["max_shots"] = backend.configuration().max_shots
+                row["max_shots"] = backend._configuration.max_shots
             except Exception:
                 pass
 

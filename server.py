@@ -657,7 +657,10 @@ def device_history(device_name: str, days: int = 7) -> str:
             SELECT ts, num_qubits, operational, pending_jobs,
                    avg_cx_error, avg_readout_error,
                    median_t1_us, median_t2_us, qubit_yield_fraction,
-                   day_of_week, hour_utc
+                   day_of_week, hour_utc,
+                   processor_family, backend_version, last_calibration_dt,
+                   clops_h, quantum_volume, avg_2q_gate_duration_ns,
+                   avg_prob_meas0_prep1, avg_prob_meas1_prep0
             FROM   device_snapshots
             WHERE  name = ?
               AND  ts >= datetime('now', ? || ' days')
@@ -674,11 +677,19 @@ def device_history(device_name: str, days: int = 7) -> str:
             "pending_jobs":        r["pending_jobs"],
             "avg_cx_error":        r["avg_cx_error"],
             "avg_readout_error":   r["avg_readout_error"],
-            "median_t1_us":         r["median_t1_us"],
-            "median_t2_us":         r["median_t2_us"],
-            "qubit_yield_fraction": r["qubit_yield_fraction"],
-            "day_of_week":          r["day_of_week"],
-            "hour_utc":             r["hour_utc"],
+            "median_t1_us":             r["median_t1_us"],
+            "median_t2_us":             r["median_t2_us"],
+            "qubit_yield_fraction":     r["qubit_yield_fraction"],
+            "day_of_week":              r["day_of_week"],
+            "hour_utc":                 r["hour_utc"],
+            "processor_family":         r["processor_family"],
+            "backend_version":          r["backend_version"],
+            "last_calibration_dt":      r["last_calibration_dt"],
+            "clops_h":                  r["clops_h"],
+            "quantum_volume":           r["quantum_volume"],
+            "avg_2q_gate_duration_ns":  r["avg_2q_gate_duration_ns"],
+            "avg_prob_meas0_prep1":     r["avg_prob_meas0_prep1"],
+            "avg_prob_meas1_prep0":     r["avg_prob_meas1_prep0"],
         }
         for r in rows
     ]
