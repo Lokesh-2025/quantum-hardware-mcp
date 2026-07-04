@@ -1079,6 +1079,10 @@ def job_results(job_id: str) -> str:
 
     total_shots = sum(counts.values()) if isinstance(counts, dict) else None
 
+    # Log outcome back to job_submissions for the 6-month study
+    if isinstance(counts, dict):
+        _snapshot.log_job_result(job_id, counts)
+
     return json.dumps({
         "job_id":      job_id,
         "status":      "DONE",

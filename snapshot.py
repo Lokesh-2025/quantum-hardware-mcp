@@ -135,9 +135,27 @@ def _init_db() -> None:
                 was_preflight_checked    INTEGER DEFAULT 0,
                 was_ai_corrected         INTEGER DEFAULT 0,
                 day_of_week              INTEGER,
-                hour_utc                 INTEGER
+                hour_utc                 INTEGER,
+                -- outcome fields (written when job_results is called)
+                result_top_bitstring     TEXT,    -- most frequent measurement outcome
+                result_top_probability   REAL,    -- top_count / total_shots (1.0 = perfect)
+                result_entropy           REAL,    -- Shannon entropy (0=perfect, higher=noisier)
+                result_num_unique        INTEGER, -- unique bitstrings seen (1=perfect)
+                result_ts                TEXT     -- when result was fetched
             )
         """)
+        for col, typedef in [
+            ("result_top_bitstring",   "TEXT"),
+            ("result_top_probability", "REAL"),
+            ("result_entropy",         "REAL"),
+            ("result_num_unique",      "INTEGER"),
+            ("result_ts",              "TEXT"),
+        ]:
+            try:
+                con.execute(f"ALTER TABLE job_submissions ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+
         con.execute("""
             CREATE INDEX IF NOT EXISTS idx_job_submissions_ts
             ON job_submissions (ts)
@@ -649,6 +667,47 @@ def log_job_submission(job_id: str, provider: str, backend_name: str,
                   shots_requested, agent_loop_iteration,
                   int(was_preflight_checked), int(was_ai_corrected),
                   now.weekday(), now.hour))
+    except Exception:
+        pass  # never crash the main flow over logging
+
+
+def log_job_result(job_id: str, counts: dict) -> None:
+    """
+    Write outcome metrics back to the job_submissions row for job_id.
+    Called from server.py when job_results() successfully retrieves counts.
+
+    Metrics computed (no ideal distribution needed — universal):
+      top_bitstring    : the most frequent measurement outcome
+      top_probability  : top_count / total_shots  (1.0 = perfect result)
+      entropy          : Shannon entropy in bits   (0 = perfect, higher = noisier)
+      num_unique       : unique bitstrings observed (1 = perfect)
+    """
+    if not counts or not isinstance(counts, dict):
+        return
+    try:
+        import math
+        total = sum(counts.values())
+        if total == 0:
+            return
+        top_bitstring = max(counts, key=counts.get)
+        top_probability = round(counts[top_bitstring] / total, 6)
+        entropy = round(
+            -sum((c / total) * math.log2(c / total)
+                 for c in counts.values() if c > 0), 6)
+        num_unique = len(counts)
+        result_ts = datetime.now(timezone.utc).isoformat()
+
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("""
+                UPDATE job_submissions
+                SET result_top_bitstring   = ?,
+                    result_top_probability = ?,
+                    result_entropy         = ?,
+                    result_num_unique      = ?,
+                    result_ts              = ?
+                WHERE job_id = ?
+            """, (top_bitstring, top_probability, entropy,
+                  num_unique, result_ts, job_id))
     except Exception:
         pass  # never crash the main flow over logging
 
