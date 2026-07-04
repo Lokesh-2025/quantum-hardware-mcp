@@ -701,6 +701,93 @@ def device_history(device_name: str, days: int = 7) -> str:
 
 
 # --------------------------------------------------------------------------
+# Tool 6b: device_profile
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def device_profile(device_name: str) -> str:
+    """
+    Return the complete hardware profile for one quantum backend using the
+    most recent snapshot — including processor family, CLOPS benchmark,
+    gate duration, last calibration time, readout asymmetry, and job limits.
+
+    This surfaces the BackendV2 extended fields that device_history and
+    get_device_details do not expose.
+
+    Args:
+        device_name: Exact backend name, e.g. "ibm_marrakesh".
+
+    Returns a JSON object with every collected field for that device.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            """
+            SELECT ts, provider, name, num_qubits, operational, pending_jobs,
+                   avg_cx_error, avg_readout_error,
+                   median_t1_us, median_t2_us, qubit_yield_fraction,
+                   native_gate_set, coupling_map_edges, connectivity_density,
+                   max_shots, max_experiments,
+                   processor_family, backend_version, online_date,
+                   last_calibration_dt, dt_ns,
+                   avg_2q_gate_duration_ns, avg_readout_length_ns,
+                   avg_prob_meas0_prep1, avg_prob_meas1_prep0,
+                   rep_delay_default_ms, clops_h, quantum_volume
+            FROM   device_snapshots
+            WHERE  name = ?
+            ORDER  BY ts DESC
+            LIMIT  1
+            """,
+            (device_name,),
+        ).fetchone()
+
+    if row is None:
+        return json.dumps({"error": f"No snapshot found for '{device_name}'. "
+                           "Run list_devices to see available backends."})
+
+    profile = {
+        "device":               row["name"],
+        "provider":             row["provider"],
+        "snapshot_ts":          row["ts"],
+        # ── Identity ──────────────────────────────────────────────────
+        "num_qubits":           row["num_qubits"],
+        "processor_family":     row["processor_family"],
+        "backend_version":      row["backend_version"],
+        "online_date":          row["online_date"],
+        "last_calibration_dt":  row["last_calibration_dt"],
+        # ── Performance benchmark ──────────────────────────────────────
+        "clops_h":              row["clops_h"],
+        "quantum_volume":       row["quantum_volume"],
+        # ── Gate quality ──────────────────────────────────────────────
+        "avg_cx_error":         row["avg_cx_error"],
+        "avg_readout_error":    row["avg_readout_error"],
+        "avg_prob_meas0_prep1": row["avg_prob_meas0_prep1"],
+        "avg_prob_meas1_prep0": row["avg_prob_meas1_prep0"],
+        # ── Coherence ─────────────────────────────────────────────────
+        "median_t1_us":         row["median_t1_us"],
+        "median_t2_us":         row["median_t2_us"],
+        "qubit_yield_fraction": row["qubit_yield_fraction"],
+        # ── Timing ────────────────────────────────────────────────────
+        "dt_ns":                    row["dt_ns"],
+        "avg_2q_gate_duration_ns":  row["avg_2q_gate_duration_ns"],
+        "avg_readout_length_ns":    row["avg_readout_length_ns"],
+        "rep_delay_default_ms":     row["rep_delay_default_ms"],
+        # ── Topology ──────────────────────────────────────────────────
+        "native_gate_set":      row["native_gate_set"],
+        "coupling_map_edges":   row["coupling_map_edges"],
+        "connectivity_density": row["connectivity_density"],
+        # ── Job limits ────────────────────────────────────────────────
+        "max_shots":            row["max_shots"],
+        "max_experiments":      row["max_experiments"],
+        # ── Live status ───────────────────────────────────────────────
+        "operational":          bool(row["operational"]) if row["operational"] is not None else None,
+        "pending_jobs":         row["pending_jobs"],
+    }
+
+    return json.dumps(profile, indent=2)
+
+
+# --------------------------------------------------------------------------
 # Tool 7: device_on_date
 # --------------------------------------------------------------------------
 
