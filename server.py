@@ -3431,45 +3431,29 @@ def run_search_experiment(
         )
 
         # ------------------------------------------------------------------
-        # Step 2: Build LNAA circuit in OpenQASM 3.0
+        # Step 2: Build LNAA circuit directly in Qiskit
         # ------------------------------------------------------------------
-        lines = []
-        lines.append('OPENQASM 3.0;')
-        lines.append('include "stdgates.inc";')
-        lines.append(f'qubit[{num_qubits}] q;')
-        lines.append(f'bit[{num_qubits}] c;')
-        lines.append('')
+        qc = QuantumCircuit(num_qubits, num_qubits)
 
         # Superposition
-        for i in range(num_qubits):
-            lines.append(f'h q[{i}];')
-        lines.append('')
+        qc.h(range(num_qubits))
 
         # p layers of phase oracle + mixing
         for layer in range(p_layers):
-            lines.append(f'// --- Layer {layer + 1} ---')
-            # RZ gates from h_i coefficients
             for q_idx, h in h_coeffs.items():
-                angle = round(2 * h * gamma, 6)
-                lines.append(f'rz({angle}) q[{q_idx}];')
-            # RZZ gates from J couplings
+                qc.rz(2 * h * gamma, q_idx)
             for (qi, qj), J in j_couplings.items():
-                angle = round(2 * J * gamma, 6)
-                lines.append(f'rzz({angle}) q[{qi}], q[{qj}];')
-            # RX mixing on all qubits
+                qc.rzz(2 * J * gamma, qi, qj)
             for i in range(num_qubits):
-                lines.append(f'rx({round(2 * beta, 6)}) q[{i}];')
-            lines.append('')
+                qc.rx(2 * beta, i)
 
-        # Measure
-        lines.append(f'c = measure q;')
-        qasm_str = '\n'.join(lines)
+        qc.measure(range(num_qubits), range(num_qubits))
 
-        # Estimate logical gate count
-        rz_count = len(h_coeffs) * p_layers
+        # Logical gate count
+        rz_count  = len(h_coeffs) * p_layers
         rzz_count = len(j_couplings) * p_layers
-        rx_count = num_qubits * p_layers
-        h_count = num_qubits
+        rx_count  = num_qubits * p_layers
+        h_count   = num_qubits
         logical_gates = h_count + rz_count + rzz_count + rx_count
 
         # ------------------------------------------------------------------
@@ -3524,11 +3508,6 @@ def run_search_experiment(
         # ------------------------------------------------------------------
         # Step 5: Submit the job
         # ------------------------------------------------------------------
-        try:
-            qc = qiskit_qasm3.loads(qasm_str)
-        except Exception as e:
-            return json.dumps({"error": f"Circuit parse failed: {e}", "qasm": qasm_str})
-
         pm = generate_preset_pass_manager(optimization_level=2, backend=best_backend, seed_transpiler=42)
         transpiled = pm.run(qc)
         hw_gate_count = transpiled.size()
@@ -3552,7 +3531,10 @@ def run_search_experiment(
         result_data = None
 
         while time.time() < deadline:
-            status = job.status().name
+            raw_status = job.status()
+            # qiskit-ibm-runtime returns either a string or a JobStatus enum
+            status = raw_status if isinstance(raw_status, str) else raw_status.name
+            status = status.upper()
             if status in ("DONE", "COMPLETED"):
                 result_data = job.result()
                 break
