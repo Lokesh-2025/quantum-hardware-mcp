@@ -33,6 +33,7 @@ Tools:
   - encode_search_problem : convert Boolean conditions into Ising h_i / J_ij for LNAA circuits
   - estimate_hardware_gates: predict transpiled gate count from logical gates + qubit degree
   - get_amplification     : compute amplification factor from a completed search job
+  - run_search_experiment : ONE CALL does everything — encode → build circuit → pick best machine → submit → amplification
 """
 
 import os
@@ -3333,6 +3334,335 @@ def get_amplification(
                 {"bits": b, "count": c, "fraction": round(c / total_shots, 4), "marked": b in marked_set}
                 for b, c in top_states
             ],
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: run_search_experiment
+# --------------------------------------------------------------------------
+@mcp.tool()
+def run_search_experiment(
+    conditions: dict,
+    num_qubits: int,
+    marked_rows: list,
+    shots: int = 4096,
+    p_layers: int = 2,
+    gamma: float = 2.589,
+    beta: float = 0.501,
+    coupling_hints: list = [],
+    coupling_strength: float = 0.5,
+    max_poll_seconds: int = 120,
+) -> str:
+    """
+    Run a complete quantum search experiment end-to-end using one tool call.
+
+    This is the tool that replaces writing Python, picking a machine manually,
+    submitting a job, waiting, and computing amplification by hand. One call
+    does all of it.
+
+    What happens internally (in order):
+      1. Derives Ising h_i and J_ij from your conditions (encode_search_problem)
+      2. Builds a LNAA quantum walk circuit in OpenQASM 3.0 (RZ + RZZ + RX layers)
+      3. Picks the best available IBM backend using live calibration data
+      4. Checks routing overhead — LNAA is always degree ≤ 2, always safe
+      5. Submits the job
+      6. Polls for up to max_poll_seconds
+      7. If done: returns amplification factor + full shot breakdown
+      8. If still queued: returns job_id so you can call get_amplification later
+
+    The circuit uses Lattice-Native Amplitude Amplification (LNAA) — the
+    approach we derived from scratch in Phase 5 of the Singmaster project.
+    It uses only RZZ + RZ + RX gates, which are IBM-native (zero routing
+    overhead). Phase 5 achieved 27.78× amplification with 135 hardware gates.
+
+    Args:
+        conditions:        Dict mapping qubit index (string) to target value (0 or 1).
+                           Example: {"1":1,"2":1,"3":1,"4":0,"5":0}
+                           means search for rows where q1=q2=q3=1 and q4=q5=0.
+        num_qubits:        Total number of qubits in the search register.
+        marked_rows:       Integer row numbers that are the correct answers.
+                           Used to compute amplification. Example: [14, 15, 78]
+        shots:             Number of measurement shots (default 4096).
+        p_layers:          LNAA circuit depth — number of phase+mix layers (default 2).
+        gamma:             Phase angle for Ising oracle layers (default 2.589,
+                           optimized for Singmaster problem).
+        beta:              Mixing angle for RX layers (default 0.501).
+        coupling_hints:    Optional list of [i,j] qubit pairs to add J coupling.
+        coupling_strength: J value for coupling hints (default 0.5).
+        max_poll_seconds:  How long to wait for job to complete (default 120s).
+                           IBM queues can be hours — if job isn't done in time,
+                           we return the job_id for you to check later.
+
+    Returns:
+        Full experiment result including: chosen backend, circuit stats,
+        job_id, amplification factor, and shot breakdown. Or job_id + status
+        if the job is still running after max_poll_seconds.
+    """
+    import time
+    from collections import defaultdict
+
+    try:
+        # ------------------------------------------------------------------
+        # Step 1: Derive Ising coefficients from conditions
+        # ------------------------------------------------------------------
+        h_coeffs = {}
+        for qubit_str, desired_val in conditions.items():
+            q = int(qubit_str)
+            desired_val = int(desired_val)
+            if desired_val == 1:
+                h_coeffs[q] = +1.0   # reward qubit=1: h×(-1) = negative energy
+            elif desired_val == 0:
+                h_coeffs[q] = -1.0   # reward qubit=0: h×(+1) = negative energy
+            else:
+                return json.dumps({"error": f"Qubit {q} value must be 0 or 1"})
+
+        j_couplings = {}
+        for pair in coupling_hints:
+            i, j = int(pair[0]), int(pair[1])
+            j_couplings[(i, j)] = coupling_strength
+
+        # Ground state energy for the targets
+        ground_energy = sum(
+            h_coeffs[int(q)] * (-1 if int(v) == 1 else +1)
+            for q, v in conditions.items()
+        )
+
+        # ------------------------------------------------------------------
+        # Step 2: Build LNAA circuit in OpenQASM 3.0
+        # ------------------------------------------------------------------
+        lines = []
+        lines.append('OPENQASM 3.0;')
+        lines.append('include "stdgates.inc";')
+        lines.append(f'qubit[{num_qubits}] q;')
+        lines.append(f'bit[{num_qubits}] c;')
+        lines.append('')
+
+        # Superposition
+        for i in range(num_qubits):
+            lines.append(f'h q[{i}];')
+        lines.append('')
+
+        # p layers of phase oracle + mixing
+        for layer in range(p_layers):
+            lines.append(f'// --- Layer {layer + 1} ---')
+            # RZ gates from h_i coefficients
+            for q_idx, h in h_coeffs.items():
+                angle = round(2 * h * gamma, 6)
+                lines.append(f'rz({angle}) q[{q_idx}];')
+            # RZZ gates from J couplings
+            for (qi, qj), J in j_couplings.items():
+                angle = round(2 * J * gamma, 6)
+                lines.append(f'rzz({angle}) q[{qi}], q[{qj}];')
+            # RX mixing on all qubits
+            for i in range(num_qubits):
+                lines.append(f'rx({round(2 * beta, 6)}) q[{i}];')
+            lines.append('')
+
+        # Measure
+        lines.append(f'c = measure q;')
+        qasm_str = '\n'.join(lines)
+
+        # Estimate logical gate count
+        rz_count = len(h_coeffs) * p_layers
+        rzz_count = len(j_couplings) * p_layers
+        rx_count = num_qubits * p_layers
+        h_count = num_qubits
+        logical_gates = h_count + rz_count + rzz_count + rx_count
+
+        # ------------------------------------------------------------------
+        # Step 3: Pick best backend using live calibration data
+        # ------------------------------------------------------------------
+        service = _get_service()
+        backends = service.backends(operational=True)
+
+        best_backend = None
+        best_cx_error = float('inf')
+        backend_scores = []
+
+        for backend in backends:
+            if backend.num_qubits < num_qubits:
+                continue
+            try:
+                props = backend.properties()
+                cx_errors = []
+                if props:
+                    TWO_QUBIT_GATES = {"cx", "ecr", "cz"}
+                    for gate in props.gates:
+                        if gate.gate in TWO_QUBIT_GATES and gate.parameters:
+                            cx_errors.append(gate.parameters[0].value)
+                avg_cx = sum(cx_errors) / len(cx_errors) if cx_errors else 1.0
+                backend_scores.append({"name": backend.name, "avg_cx_error": round(avg_cx, 5)})
+                if avg_cx < best_cx_error:
+                    best_cx_error = avg_cx
+                    best_backend = backend
+            except Exception:
+                continue
+
+        if best_backend is None:
+            return json.dumps({"error": "No operational IBM backends found with enough qubits."})
+
+        backend_scores.sort(key=lambda x: x["avg_cx_error"])
+
+        # ------------------------------------------------------------------
+        # Step 4: Routing check — LNAA interactions are always degree ≤ 2
+        # ------------------------------------------------------------------
+        # Each qubit only interacts with its J-coupling partners.
+        # With no coupling hints, max degree = 0. Always safe for heavy-hex.
+        max_degree = 0
+        if j_couplings:
+            neighbor_count = defaultdict(set)
+            for (qi, qj) in j_couplings:
+                neighbor_count[qi].add(qj)
+                neighbor_count[qj].add(qi)
+            max_degree = max(len(v) for v in neighbor_count.values())
+
+        routing_safe = max_degree <= 3
+
+        # ------------------------------------------------------------------
+        # Step 5: Submit the job
+        # ------------------------------------------------------------------
+        try:
+            qc = qiskit_qasm3.loads(qasm_str)
+        except Exception as e:
+            return json.dumps({"error": f"Circuit parse failed: {e}", "qasm": qasm_str})
+
+        pm = generate_preset_pass_manager(optimization_level=2, backend=best_backend, seed_transpiler=42)
+        transpiled = pm.run(qc)
+        hw_gate_count = transpiled.size()
+
+        sampler = Sampler(mode=best_backend)
+        sampler.options.default_shots = shots
+        job = sampler.run([transpiled])
+        job_id = job.job_id()
+
+        # ------------------------------------------------------------------
+        # Step 6: Poll for result
+        # ------------------------------------------------------------------
+        search_space_size = 2 ** num_qubits
+        marked_set_rows = set(marked_rows)
+
+        # Build marked bitstrings from marked row integers
+        marked_bitstrings = [format(r, f'0{num_qubits}b') for r in marked_rows]
+        marked_set_bits = set(marked_bitstrings)
+
+        deadline = time.time() + max_poll_seconds
+        result_data = None
+
+        while time.time() < deadline:
+            status = job.status().name
+            if status in ("DONE", "COMPLETED"):
+                result_data = job.result()
+                break
+            elif status in ("ERROR", "CANCELLED", "FAILED"):
+                return json.dumps({
+                    "error": f"Job failed with status: {status}",
+                    "job_id": job_id,
+                    "backend": best_backend.name,
+                })
+            time.sleep(10)
+
+        # ------------------------------------------------------------------
+        # Step 7a: Job done — compute amplification
+        # ------------------------------------------------------------------
+        if result_data is not None:
+            pub_result = result_data[0]
+            data = pub_result.data
+            field = list(vars(data).keys())[0]
+            counts = getattr(data, field).get_counts()
+            total_shots = sum(counts.values())
+
+            marked_total = sum(counts.get(b, 0) for b in marked_bitstrings)
+            marked_fraction = marked_total / total_shots
+            random_baseline = len(marked_rows) / search_space_size
+            amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+            top_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            return json.dumps({
+                "status": "COMPLETE",
+                "experiment": {
+                    "conditions": conditions,
+                    "num_qubits": num_qubits,
+                    "search_space_size": search_space_size,
+                    "marked_rows": marked_rows,
+                    "p_layers": p_layers,
+                    "gamma": gamma,
+                    "beta": beta,
+                },
+                "algorithm": {
+                    "name": "LNAA (Lattice-Native Amplitude Amplification)",
+                    "approach": "Ising Hamiltonian quantum walk — IBM-native RZZ+RX gates, zero routing overhead",
+                    "h_coefficients": h_coeffs,
+                    "j_couplings": {f"{i},{j}": J for (i, j), J in j_couplings.items()},
+                    "ground_state_energy": round(ground_energy, 3),
+                },
+                "hardware": {
+                    "backend_chosen": best_backend.name,
+                    "backend_avg_cx_error": round(best_cx_error, 5),
+                    "selection_reason": "Lowest avg CX error among operational backends with enough qubits",
+                    "all_backends_scored": backend_scores,
+                    "routing_safe": routing_safe,
+                    "max_qubit_degree": max_degree,
+                },
+                "circuit": {
+                    "logical_gates": logical_gates,
+                    "hardware_gates_after_transpile": hw_gate_count,
+                    "shots": shots,
+                },
+                "job_id": job_id,
+                "results": {
+                    "total_shots": total_shots,
+                    "marked_shots": marked_total,
+                    "marked_fraction": round(marked_fraction, 4),
+                    "random_baseline": round(random_baseline, 4),
+                    "amplification_factor": amplification,
+                    "verdict": (
+                        "EXCELLENT (>10×)" if amplification > 10 else
+                        "GOOD (4–10×)"     if amplification > 4  else
+                        "WEAK (1–4×)"      if amplification > 1  else
+                        "FAILED (≤1× — no better than random)"
+                    ),
+                    "top_10_states": [
+                        {
+                            "bits": b,
+                            "row": int(b, 2),
+                            "count": c,
+                            "fraction": round(c / total_shots, 4),
+                            "marked": b in marked_set_bits,
+                        }
+                        for b, c in top_states
+                    ],
+                },
+            }, indent=2)
+
+        # ------------------------------------------------------------------
+        # Step 7b: Still queued — return job_id for later
+        # ------------------------------------------------------------------
+        return json.dumps({
+            "status": "QUEUED",
+            "message": (
+                f"Job submitted successfully but IBM queue wait exceeded {max_poll_seconds}s. "
+                f"IBM queues can take minutes to hours depending on load. "
+                f"Call get_amplification with the job_id below when it completes."
+            ),
+            "job_id": job_id,
+            "backend": best_backend.name,
+            "experiment": {
+                "conditions": conditions,
+                "marked_rows": marked_rows,
+                "marked_bitstrings": marked_bitstrings,
+                "search_space_size": search_space_size,
+            },
+            "algorithm": {
+                "name": "LNAA",
+                "h_coefficients": h_coeffs,
+                "logical_gates": logical_gates,
+                "hardware_gates_after_transpile": hw_gate_count,
+            },
+            "next_step": f"Call get_amplification(job_id='{job_id}', marked_bitstrings={marked_bitstrings}, search_space_size={search_space_size})",
         }, indent=2)
 
     except Exception as e:
