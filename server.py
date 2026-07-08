@@ -34,8 +34,10 @@ Tools:
   - estimate_hardware_gates: predict transpiled gate count from logical gates + qubit degree
   - get_amplification     : compute amplification factor from a completed search job
   - run_search_experiment    : ONE CALL does everything — encode → build circuit → pick best machine → submit → amplification
-  - encode_collision_problem   : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
-  - discover_energy_landscape  : (PLANNED) given any math domain + constraints, auto-generate candidate Hamiltonian, estimate qubits/routing/gates, report if practical on current hardware
+  - encode_collision_problem        : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
+  - discover_collision_candidates   : scout — filters ALL k-pairs for hardware-feasible collisions before spending QPU credits
+  - run_parallel_collision_search   : ONE job, MULTIPLE k-pair searches on parallel 9-qubit rails across ibm_marrakesh's 156 qubits
+  - discover_energy_landscape       : (PLANNED) given any math domain + constraints, auto-generate candidate Hamiltonian, estimate qubits/routing/gates, report if practical on current hardware
 """
 
 import os
@@ -3343,6 +3345,111 @@ def get_amplification(
 
 
 # --------------------------------------------------------------------------
+# Tool: discover_collision_candidates
+# --------------------------------------------------------------------------
+@mcp.tool()
+def discover_collision_candidates(
+    max_n: int = 100,
+    max_k: int = 10,
+    target_multiplicity: int = 2,
+) -> str:
+    """
+    Scout tool — runs BEFORE any circuit is built.
+
+    Classically filters ALL (k1,k2) column pairs in Pascal's Triangle,
+    finds which ones produce actual collisions in the given range, and
+    ranks them by hardware feasibility (qubit count, expected gate count,
+    Ising sparsity).
+
+    Use this to decide WHAT to search before spending QPU credits.
+
+    Args:
+      max_n              : search rows 0..max_n
+      max_k              : check column pairs k1,k2 up to max_k
+      target_multiplicity: 2 = 2-way collision, 4 = 4-way (Singmaster record)
+
+    Returns ranked list of candidate searches with hardware cost estimate.
+    """
+    try:
+        from math import comb, ceil, log2
+
+        results = []
+
+        # Check all (k1, k2) pairs where k1 < k2
+        for k1 in range(1, max_k + 1):
+            for k2 in range(k1 + 1, max_k + 1):
+
+                # Build value tables
+                table1 = {}
+                for n in range(k1, max_n + 1):
+                    v = comb(n, k1)
+                    table1.setdefault(v, []).append(n)
+
+                table2 = {}
+                for n in range(k2, max_n + 1):
+                    v = comb(n, k2)
+                    table2.setdefault(v, []).append(n)
+
+                # Find collisions
+                shared = set(table1) & set(table2)
+                non_trivial = [v for v in shared if v > 1]
+
+                if not non_trivial:
+                    continue
+
+                # Count collision pairs
+                pairs = []
+                for v in sorted(non_trivial, reverse=True)[:5]:
+                    for n1 in table1[v]:
+                        for n2 in table2[v]:
+                            pairs.append((n1, n2, v))
+
+                # Estimate hardware cost
+                bits1 = max(1, ceil(log2(max_n + 1)))
+                bits2 = max(1, ceil(log2(max_n + 1)))
+                num_qubits = bits1 + bits2
+                # LNAA: H + p*(RZ per qubit + RX per qubit) gates
+                logical_gates = num_qubits + 2 * num_qubits * 2  # p=2 layers
+                hardware_gates = logical_gates  # RZZ/RX are native, no routing
+
+                # Heavy-hex feasibility check: degree ≤ 3
+                # Each qubit connects to at most 2 neighbours in our linear LNAA
+                feasible = hardware_gates < 600
+
+                results.append({
+                    "k1": k1,
+                    "k2": k2,
+                    "num_collisions": len(pairs),
+                    "top_collision": {"n1": pairs[0][0], "n2": pairs[0][1], "value": pairs[0][2]} if pairs else None,
+                    "num_qubits": num_qubits,
+                    "estimated_hardware_gates": hardware_gates,
+                    "heavy_hex_feasible": feasible,
+                    "recommended": feasible and len(pairs) >= 1,
+                })
+
+        # Sort: feasible first, then by number of collisions
+        results.sort(key=lambda r: (-int(r["recommended"]), -r["num_collisions"]))
+
+        recommended = [r for r in results if r["recommended"]]
+        not_recommended = [r for r in results if not r["recommended"]]
+
+        return json.dumps({
+            "total_pairs_checked": max_k * (max_k - 1) // 2,
+            "pairs_with_collisions": len(results),
+            "recommended_for_hardware": len(recommended),
+            "top_candidates": recommended[:10],
+            "avoid": not_recommended[:5],
+            "next_step": (
+                f"Run encode_collision_problem + run_parallel_collision_search "
+                f"with these k-pairs: {[(r['k1'],r['k2']) for r in recommended[:5]]}"
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
 # Tool: encode_collision_problem
 # --------------------------------------------------------------------------
 @mcp.tool()
@@ -3917,6 +4024,239 @@ def run_search_experiment(
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: run_parallel_collision_search
+# --------------------------------------------------------------------------
+@mcp.tool()
+def run_parallel_collision_search(
+    k_pairs: list,
+    max_n: int = 20,
+    shots: int = 4096,
+    p_layers: int = 2,
+    gamma: float = 2.589,
+    beta: float = 0.501,
+    simulate_only: bool = True,
+    backend_name: str = "",
+) -> str:
+    """
+    Parallel rails — ONE job, MULTIPLE collision searches simultaneously.
+
+    Instead of one 9-qubit search, tiles multiple independent LNAA rings
+    on ibm_marrakesh (156 qubits). Each ring searches a different (k1,k2)
+    column pair. No cross-talk between rings. One submission.
+
+    Why this matters:
+      ibm_marrakesh has 156 qubits. Our basic search uses 9.
+      We can run ~10 independent searches in one job for the same cost.
+
+    Args:
+      k_pairs    : list of [k1,k2] pairs, e.g. [[2,3],[3,4],[4,5]]
+      max_n      : search rows 0..max_n for each pair
+      shots      : total shots (split across rails in simulation)
+      simulate_only: True = free simulation, False = real hardware
+
+    Returns amplification for each rail and combined best result.
+    """
+    try:
+        from math import comb, ceil, log2
+        from collections import defaultdict
+
+        if not k_pairs or len(k_pairs) == 0:
+            return json.dumps({"error": "k_pairs must be a non-empty list like [[2,3],[3,4]]"})
+
+        # ── 1. Encode each rail classically ───────────────────────────────
+        rails = []
+        for pair in k_pairs:
+            k1, k2 = int(pair[0]), int(pair[1])
+
+            table1 = {}
+            for n in range(k1, max_n + 1):
+                table1.setdefault(comb(n, k1), []).append(n)
+            table2 = {}
+            for n in range(k2, max_n + 1):
+                table2.setdefault(comb(n, k2), []).append(n)
+
+            collisions = []
+            for v in sorted(set(table1) & set(table2)):
+                if v > 1:
+                    for n1 in table1[v]:
+                        for n2 in table2[v]:
+                            collisions.append({"n1": n1, "n2": n2, "value": v})
+
+            if not collisions:
+                rails.append({"k1": k1, "k2": k2, "status": "no_collisions", "collisions": []})
+                continue
+
+            bits1 = max(1, ceil(log2(max_n + 1)))
+            bits2 = max(1, ceil(log2(max_n + 1)))
+            num_qubits = bits1 + bits2
+
+            # Primary target = largest value collision
+            primary = max(collisions, key=lambda c: c["value"])
+            n1_p, n2_p = primary["n1"], primary["n2"]
+
+            # Conditions from primary collision bit pattern
+            conditions = {}
+            for i in range(bits1):
+                conditions[i] = int((n1_p >> i) & 1)
+            for i in range(bits2):
+                conditions[bits1 + i] = int((n2_p >> i) & 1)
+
+            # marked_rows as Qiskit integers
+            marked_rows = []
+            for col in collisions:
+                qbits = [(col["n1"] >> i) & 1 for i in range(bits1)]
+                qbits += [(col["n2"] >> i) & 1 for i in range(bits2)]
+                marked_rows.append(int("".join(str(b) for b in reversed(qbits)), 2))
+
+            rails.append({
+                "k1": k1, "k2": k2,
+                "collisions": collisions,
+                "primary": primary,
+                "num_qubits": num_qubits,
+                "conditions": conditions,
+                "marked_rows": marked_rows,
+                "bits1": bits1, "bits2": bits2,
+            })
+
+        active_rails = [r for r in rails if r.get("conditions")]
+        if not active_rails:
+            return json.dumps({"error": "No valid collision pairs found in given range.", "rails": rails})
+
+        # ── 2. Build parallel circuit — stack rails side by side ──────────
+        from qiskit import QuantumCircuit
+
+        # Each rail gets its own qubit block, offset by rail index
+        total_qubits = sum(r["num_qubits"] for r in active_rails)
+        qc = QuantumCircuit(total_qubits, total_qubits)
+
+        qubit_offset = 0
+        rail_qubit_ranges = []
+
+        for rail in active_rails:
+            nq = rail["num_qubits"]
+            qrange = list(range(qubit_offset, qubit_offset + nq))
+            rail_qubit_ranges.append(qrange)
+
+            # Superposition for this rail
+            qc.h(qrange)
+
+            # h_coeffs from conditions
+            h_coeffs = {}
+            for q_local, val in rail["conditions"].items():
+                h_coeffs[int(q_local)] = +1.0 if val == 1 else -1.0
+
+            # p layers of LNAA
+            for _ in range(p_layers):
+                for q_local, h in h_coeffs.items():
+                    qc.rz(2 * h * gamma, qubit_offset + q_local)
+                for i in range(nq):
+                    qc.rx(2 * beta, qubit_offset + i)
+
+            # Measure this rail into its own classical bits
+            for i, q in enumerate(qrange):
+                qc.measure(q, qubit_offset + i)
+
+            qubit_offset += nq
+
+        logical_gates = qc.size()
+
+        # ── 3. Simulate or submit ─────────────────────────────────────────
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            sim = AerSimulator()
+            sim_pm = _gpm(optimization_level=1, backend=sim)
+            sim_qc = sim_pm.run(qc)
+            from qiskit_aer.primitives import SamplerV2 as AerSampler
+            aer_sampler = AerSampler()
+            result = aer_sampler.run([sim_qc], shots=shots).result()
+            pub = result[0]
+            data = pub.data
+            field = list(vars(data).keys())[0]
+            counts = getattr(data, field).get_counts()
+        else:
+            from qiskit_ibm_runtime import QiskitRuntimeService
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+
+            token = os.getenv("IBM_QUANTUM_TOKEN")
+            if not token:
+                return json.dumps({"error": "IBM_QUANTUM_TOKEN not set in .env"})
+
+            svc = QiskitRuntimeService(channel="ibm_quantum", token=token)
+            bname = backend_name or "ibm_marrakesh"
+            backend = svc.backend(bname)
+            pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
+            t_qc = pm.run(qc)
+            sampler = IBMSampler(mode=backend)
+            job = sampler.run([t_qc], shots=shots)
+            return json.dumps({
+                "status": "submitted",
+                "job_id": job.job_id(),
+                "backend": bname,
+                "total_qubits": total_qubits,
+                "logical_gates": logical_gates,
+                "rails": [{"k1": r["k1"], "k2": r["k2"], "primary": r.get("primary")} for r in active_rails],
+                "note": f"Use job_results('{job.job_id()}') to get results when done.",
+            }, indent=2)
+
+        # ── 4. Split counts back per rail and compute amplification ───────
+        rail_results = []
+        qubit_offset = 0
+
+        for rail, qrange in zip(active_rails, rail_qubit_ranges):
+            nq = rail["num_qubits"]
+            marked_set = set(format(r, f'0{nq}b') for r in rail["marked_rows"])
+            search_space = 2 ** nq
+            random_baseline = len(rail["marked_rows"]) / search_space
+
+            # Extract this rail's bits from the full bitstring
+            rail_counts = defaultdict(int)
+            for full_bits, cnt in counts.items():
+                # Qiskit bitstring is MSB-first for the full register
+                # Extract the bits belonging to this rail
+                rail_bits = full_bits[total_qubits - qubit_offset - nq: total_qubits - qubit_offset]
+                rail_counts[rail_bits] += cnt
+
+            total = sum(rail_counts.values())
+            marked_total = sum(rail_counts.get(b, 0) for b in marked_set)
+            marked_fraction = marked_total / total if total > 0 else 0
+            amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+            top = sorted(rail_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            rail_results.append({
+                "k1": rail["k1"], "k2": rail["k2"],
+                "primary_target": rail.get("primary"),
+                "amplification": amplification,
+                "marked_fraction_pct": round(marked_fraction * 100, 2),
+                "random_baseline_pct": round(random_baseline * 100, 2),
+                "top_states": [{"bits": b, "count": c} for b, c in top],
+            })
+
+            qubit_offset += nq
+
+        best = max(rail_results, key=lambda r: r["amplification"])
+
+        return json.dumps({
+            "mode": "simulation" if simulate_only else "hardware",
+            "total_qubits_used": total_qubits,
+            "logical_gates": logical_gates,
+            "rails_run": len(active_rails),
+            "rail_results": rail_results,
+            "best_rail": best,
+            "summary": (
+                f"{len(active_rails)} searches in ONE job. "
+                f"Best: k={best['k1']}vs{best['k2']} → {best['amplification']}× amplification."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
 
 
 # --------------------------------------------------------------------------
