@@ -3355,51 +3355,51 @@ def run_search_experiment(
     coupling_hints: list = [],
     coupling_strength: float = 0.5,
     max_poll_seconds: int = 120,
+    simulate_only: bool = True,
 ) -> str:
     """
     Run a complete quantum search experiment end-to-end using one tool call.
 
-    This is the tool that replaces writing Python, picking a machine manually,
-    submitting a job, waiting, and computing amplification by hand. One call
-    does all of it.
+    DEFAULT: simulate_only=True — runs a FREE noiseless simulation first.
+    No QPU credits spent. Use this to validate your Hamiltonian, tune
+    gamma/beta parameters, and confirm amplification before touching hardware.
 
-    What happens internally (in order):
-      1. Derives Ising h_i and J_ij from your conditions (encode_search_problem)
-      2. Builds a LNAA quantum walk circuit in OpenQASM 3.0 (RZ + RZZ + RX layers)
-      3. Picks the best available IBM backend using live calibration data
-      4. Checks routing overhead — LNAA is always degree ≤ 2, always safe
-      5. Submits the job
-      6. Polls for up to max_poll_seconds
-      7. If done: returns amplification factor + full shot breakdown
-      8. If still queued: returns job_id so you can call get_amplification later
+    Only set simulate_only=False when simulation shows strong amplification
+    (>10×) and you are ready to submit to real IBM hardware.
 
-    The circuit uses Lattice-Native Amplitude Amplification (LNAA) — the
-    approach we derived from scratch in Phase 5 of the Singmaster project.
-    It uses only RZZ + RZ + RX gates, which are IBM-native (zero routing
-    overhead). Phase 5 achieved 27.78× amplification with 135 hardware gates.
+    What happens internally:
+
+    SIMULATE mode (simulate_only=True, FREE):
+      1. Derives Ising h_i and J_ij from your conditions
+      2. Builds LNAA circuit (RZ + RZZ + RX layers)
+      3. Runs noiseless Aer simulation — zero QPU cost
+      4. Returns amplification + suggestion (ready for hardware or tune more)
+
+    HARDWARE mode (simulate_only=False, uses QPU credits):
+      1-4. Same as above
+      5. Picks best IBM backend using live calibration data
+      6. Checks routing overhead
+      7. Transpiles at opt=2 seed=42
+      8. Submits job, polls, returns amplification
 
     Args:
         conditions:        Dict mapping qubit index (string) to target value (0 or 1).
                            Example: {"1":1,"2":1,"3":1,"4":0,"5":0}
-                           means search for rows where q1=q2=q3=1 and q4=q5=0.
         num_qubits:        Total number of qubits in the search register.
         marked_rows:       Integer row numbers that are the correct answers.
-                           Used to compute amplification. Example: [14, 15, 78]
-        shots:             Number of measurement shots (default 4096).
-        p_layers:          LNAA circuit depth — number of phase+mix layers (default 2).
-        gamma:             Phase angle for Ising oracle layers (default 2.589,
-                           optimized for Singmaster problem).
-        beta:              Mixing angle for RX layers (default 0.501).
-        coupling_hints:    Optional list of [i,j] qubit pairs to add J coupling.
+        shots:             Number of shots (default 4096).
+        p_layers:          LNAA layers — higher = more precise but deeper circuit (default 2).
+        gamma:             Phase angle for Ising oracle (default 2.589).
+        beta:              Mixing angle for RX layer (default 0.501).
+        coupling_hints:    Optional [i,j] pairs for J coupling between qubits.
         coupling_strength: J value for coupling hints (default 0.5).
-        max_poll_seconds:  How long to wait for job to complete (default 120s).
-                           IBM queues can be hours — if job isn't done in time,
-                           we return the job_id for you to check later.
+        max_poll_seconds:  Hardware only — how long to wait before returning job_id (default 120s).
+        simulate_only:     True = free noiseless simulation with suggestion (DEFAULT).
+                           False = submit to real IBM hardware (costs QPU credits).
 
     Returns:
-        Full experiment result including: chosen backend, circuit stats,
-        job_id, amplification factor, and shot breakdown. Or job_id + status
-        if the job is still running after max_poll_seconds.
+        Amplification factor, shot breakdown, Hamiltonian used, and a
+        recommendation on whether to submit to hardware or tune parameters first.
     """
     import time
     from collections import defaultdict
@@ -3457,7 +3457,112 @@ def run_search_experiment(
         logical_gates = h_count + rz_count + rzz_count + rx_count
 
         # ------------------------------------------------------------------
-        # Step 3: Pick best backend using live calibration data
+        # Step 3a: SIMULATE MODE — free noiseless run, no QPU
+        # ------------------------------------------------------------------
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            sim = AerSimulator()
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            sim_pm = _gpm(optimization_level=1, backend=sim)
+            sim_qc = sim_pm.run(qc)
+            from qiskit_aer.primitives import SamplerV2 as AerSampler
+            aer_sampler = AerSampler()
+            sim_job = aer_sampler.run([sim_qc], shots=shots)
+            sim_result = sim_job.result()
+            pub = sim_result[0]
+            data = pub.data
+            field = list(vars(data).keys())[0]
+            counts = getattr(data, field).get_counts()
+
+            total_shots   = sum(counts.values())
+            search_space_size = 2 ** num_qubits
+            marked_bitstrings = [format(r, f'0{num_qubits}b') for r in marked_rows]
+            marked_set_bits   = set(marked_bitstrings)
+            marked_total  = sum(counts.get(b, 0) for b in marked_bitstrings)
+            marked_fraction   = marked_total / total_shots
+            random_baseline   = len(marked_rows) / search_space_size
+            amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+            top_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            # Suggestion logic
+            if amplification >= 15:
+                suggestion = (
+                    f"READY FOR HARDWARE. Simulation shows {amplification}× amplification — "
+                    f"strong signal. Call run_search_experiment with simulate_only=False to submit to IBM hardware."
+                )
+            elif amplification >= 5:
+                suggestion = (
+                    f"GOOD but could be better ({amplification}×). Try tuning gamma (current: {gamma}) "
+                    f"in range [1.5, 3.5] or increase p_layers to 3. Rerun simulation before hardware."
+                )
+            elif amplification >= 2:
+                suggestion = (
+                    f"WEAK signal ({amplification}×). Hamiltonian may need revisiting. "
+                    f"Check that all marked_rows satisfy your conditions. "
+                    f"Try different gamma/beta or add coupling_hints to break degeneracy."
+                )
+            else:
+                suggestion = (
+                    f"NO SIGNAL ({amplification}×). Do NOT submit to hardware — would waste QPU credits. "
+                    f"Revisit the Hamiltonian: verify h_i signs using E = Σ h_i × Z_i "
+                    f"where Z_i = -1 if bit=1, +1 if bit=0. Marked rows should have negative energy."
+                )
+
+            return json.dumps({
+                "mode": "SIMULATION (free — no QPU used)",
+                "experiment": {
+                    "conditions": conditions,
+                    "num_qubits": num_qubits,
+                    "search_space_size": search_space_size,
+                    "marked_rows": marked_rows,
+                    "p_layers": p_layers,
+                    "gamma": gamma,
+                    "beta": beta,
+                },
+                "algorithm": {
+                    "name": "LNAA (Lattice-Native Amplitude Amplification)",
+                    "h_coefficients": h_coeffs,
+                    "j_couplings": {f"{i},{j}": J for (i, j), J in j_couplings.items()},
+                    "ground_state_energy": round(ground_energy, 3),
+                },
+                "circuit": {
+                    "logical_gates": logical_gates,
+                    "shots": shots,
+                },
+                "results": {
+                    "total_shots": total_shots,
+                    "marked_shots": marked_total,
+                    "marked_fraction": round(marked_fraction, 4),
+                    "random_baseline": round(random_baseline, 4),
+                    "amplification_factor": amplification,
+                    "verdict": (
+                        "EXCELLENT (>10×)" if amplification > 10 else
+                        "GOOD (5–10×)"     if amplification > 5  else
+                        "WEAK (2–5×)"      if amplification > 2  else
+                        "NO SIGNAL (≤2×)"
+                    ),
+                    "top_10_states": [
+                        {
+                            "bits": b,
+                            "row": int(b, 2),
+                            "count": c,
+                            "fraction": round(c / total_shots, 4),
+                            "marked": b in marked_set_bits,
+                        }
+                        for b, c in top_states
+                    ],
+                },
+                "suggestion": suggestion,
+                "next_step": (
+                    "run_search_experiment(..., simulate_only=False)"
+                    if amplification >= 15
+                    else "Tune parameters and rerun simulation first."
+                ),
+            }, indent=2)
+
+        # ------------------------------------------------------------------
+        # Step 3b: HARDWARE MODE — pick best backend using live calibration
         # ------------------------------------------------------------------
         service = _get_service()
         backends = service.backends(operational=True)
