@@ -34,7 +34,8 @@ Tools:
   - estimate_hardware_gates: predict transpiled gate count from logical gates + qubit degree
   - get_amplification     : compute amplification factor from a completed search job
   - run_search_experiment    : ONE CALL does everything — encode → build circuit → pick best machine → submit → amplification
-  - encode_collision_problem : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
+  - encode_collision_problem   : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
+  - discover_energy_landscape  : (PLANNED) given any math domain + constraints, auto-generate candidate Hamiltonian, estimate qubits/routing/gates, report if practical on current hardware
 """
 
 import os
@@ -3422,87 +3423,79 @@ def encode_collision_problem(
         bits2 = max(1, ceil(log2(max_n2 + 1)))
         num_qubits = bits1 + bits2
 
-        # ── 3. Build Ising h_i from collision bit patterns ─────────────────
-        # For each collision solution, the bit patterns of n1 and n2 are
-        # "good states". We sum the rewards across all solutions, then
-        # normalise so no single h_i dominates.
-        #
-        # Convention: qubit i → h_i = +1 means "reward bit=1 here"
-        #                         h_i = -1 means "reward bit=0 here"
-        # We aggregate votes across all collision solutions.
+        # ── 3. Pick primary target — largest-value non-trivial collision ──────
+        # Sort by value descending so the most interesting collision drives
+        # the Ising encoding (e.g. C(16,2)=C(10,3)=120 beats C(2,2)=C(3,3)=1)
+        non_trivial = [c for c in collisions if c["value"] > 1]
+        primary = max(non_trivial, key=lambda c: c["value"]) if non_trivial else collisions[0]
+        n1_p, n2_p = primary["n1"], primary["n2"]
 
-        h_votes = [0] * num_qubits   # positive = more solutions have bit=1 here
+        # ── 4. Build conditions dict from primary collision's exact bit pattern ─
+        # run_search_experiment expects {qubit_str: 0_or_1}
+        # q0..q(bits1-1) encode n1 LSB-first
+        # q(bits1)..q(num_qubits-1) encode n2 LSB-first
+        conditions = {}
+        for i in range(bits1):
+            conditions[str(i)] = int((n1_p >> i) & 1)
+        for i in range(bits2):
+            conditions[str(bits1 + i)] = int((n2_p >> i) & 1)
 
+        # ── 5. Convert all collisions to Qiskit-format integer marked_rows ────
+        # Qiskit counts bitstring = qubit[n-1]...qubit[1]qubit[0] (MSB-first).
+        # format(r, '0{n}b') matches that convention, so we reverse our
+        # LSB-first qubit list before converting to int.
+        marked_rows = []
+        marked_labels = []
         for col in collisions:
             n1, n2 = col["n1"], col["n2"]
-            # register 1: qubits 0..bits1-1 (LSB first)
+            qbits = []
             for i in range(bits1):
-                bit = (n1 >> i) & 1
-                h_votes[i] += 1 if bit == 1 else -1
-            # register 2: qubits bits1..bits1+bits2-1
+                qbits.append((n1 >> i) & 1)   # q0..q(bits1-1), LSB first
             for i in range(bits2):
-                bit = (n2 >> i) & 1
-                h_votes[bits1 + i] += 1 if bit == 1 else -1
+                qbits.append((n2 >> i) & 1)   # q(bits1)..q(end), LSB first
+            # Qiskit string = reversed → integer
+            qiskit_int = int("".join(str(b) for b in reversed(qbits)), 2)
+            marked_rows.append(qiskit_int)
+            marked_labels.append({
+                "n1": n1, "n2": n2, "value": col["value"],
+                "qiskit_int": qiskit_int,
+                "qiskit_bitstring": format(qiskit_int, f'0{num_qubits}b'),
+            })
 
-        # Convert votes to ±1 h coefficients
-        h_coeffs = {}
-        for i, v in enumerate(h_votes):
-            if v != 0:
-                h_coeffs[str(i)] = 1.0 if v > 0 else -1.0
-            # qubits with zero net vote get no h term → neutral
-
-        # ── 4. Build marked_states list for get_amplification ──────────────
-        marked_states = []
-        for col in collisions:
-            n1, n2 = col["n1"], col["n2"]
-            # build full bit-string: register1 (bits1 wide) | register2 (bits2 wide)
-            # LSB-first within each register, register1 at lower qubit indices
-            bits = []
-            for i in range(bits1):
-                bits.append(str((n1 >> i) & 1))
-            for i in range(bits2):
-                bits.append(str((n2 >> i) & 1))
-            marked_states.append("".join(bits))
-
-        # ── 5. Describe each qubit so experiments are readable ────────────
+        # ── 6. Describe each qubit ────────────────────────────────────────────
         qubit_map = {}
         for i in range(bits1):
             qubit_map[str(i)] = f"n1 bit {i} (2^{i}={2**i})"
         for i in range(bits2):
             qubit_map[str(bits1 + i)] = f"n2 bit {i} (2^{i}={2**i})"
 
-        # ── 6. Ready-to-use params for run_search_experiment ──────────────
+        # ── 7. Ready-to-use params for run_search_experiment ─────────────────
         run_params = {
-            "conditions": {
-                "description": f"Find n1,n2 where C(n1,{k1})=C(n2,{k2})",
-                "k1": k1, "k2": k2,
-                "max_n1": max_n1, "max_n2": max_n2,
-            },
+            "conditions": conditions,
             "num_qubits": num_qubits,
-            "marked_rows": marked_states,
+            "marked_rows": marked_rows,
             "shots": 4096,
             "p_layers": 2,
             "gamma": 2.589,
             "beta": 0.501,
             "simulate_only": True,
         }
-        # Pass h_coeffs as coupling hints via conditions
-        run_params["conditions"]["h_coeffs"] = h_coeffs
 
         return json.dumps({
             "collisions": collisions,
+            "primary_target": primary,
             "num_collision_pairs": len(collisions),
             "num_qubits": num_qubits,
             "bits_register_1": bits1,
             "bits_register_2": bits2,
             "qubit_map": qubit_map,
-            "h_coeffs": h_coeffs,
-            "marked_states": marked_states,
+            "conditions": conditions,
+            "marked_rows": marked_rows,
+            "marked_labels": marked_labels,
             "run_search_params": run_params,
             "validation_hint": (
-                f"Ground truth: C({collisions[0]['n1']},{k1}) = "
-                f"C({collisions[0]['n2']},{k2}) = {collisions[0]['value']}"
-                if collisions else ""
+                f"Primary target: C({n1_p},{k1}) = C({n2_p},{k2}) = {primary['value']}. "
+                f"LNAA should amplify Qiskit state {format(marked_rows[marked_labels.index(next(l for l in marked_labels if l['n1']==n1_p))] if marked_rows else 0, f'0{num_qubits}b')}."
             ),
         }, indent=2)
 
