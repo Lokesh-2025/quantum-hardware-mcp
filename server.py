@@ -29,6 +29,10 @@ Tools:
   - repro_score           : compute 0-1 reproducibility score after runs complete
   - estimate_runtime      : estimate how many minutes a circuit will cost on a device
   - route_job             : recommend the cheapest device that fits your circuit + time budget
+  - check_routing_overhead: predict SWAP inflation from qubit interaction graph (degree > 3 = danger)
+  - encode_search_problem : convert Boolean conditions into Ising h_i / J_ij for LNAA circuits
+  - estimate_hardware_gates: predict transpiled gate count from logical gates + qubit degree
+  - get_amplification     : compute amplification factor from a completed search job
 """
 
 import os
@@ -439,17 +443,44 @@ def best_qubits(device_name: str, n: int = 5) -> str:
         })
 
     qubit_data.sort(key=lambda q: q["score"])
+    top_n = qubit_data[:n]
 
-    return json.dumps(
-        {
-            "device":   device_name,
-            "n":        n,
-            "scoring":  "readout_error + best_cx_error (lower = better). "
-                        "T1/T2 shown for context but not in score.",
-            "best_qubits": qubit_data[:n],
+    # Connectivity check: warn if the returned qubits are not all connected
+    # on the hardware graph. Unconnected qubit sets force SWAP injection.
+    top_indices = {q["qubit"] for q in top_n}
+    coupling_map = backend.coupling_map
+    connected_pairs = []
+    disconnected_warning = None
+    if coupling_map is not None:
+        edges = list(coupling_map.get_edges())
+        connected_pairs = [
+            [a, b] for a, b in edges
+            if a in top_indices and b in top_indices
+        ]
+        # A set of n qubits needs at least n-1 edges to be connected (tree).
+        if len(connected_pairs) < n - 1:
+            disconnected_warning = (
+                f"WARNING: the top {n} qubits by score are NOT all connected "
+                f"on {device_name}'s coupling map. Only {len(connected_pairs)} "
+                f"direct links found between them. Running a multi-qubit circuit "
+                f"on these qubits will require SWAP gates, increasing your gate "
+                f"count. Consider using check_routing_overhead or picking qubits "
+                f"from a connected subgraph."
+            )
+
+    result = {
+        "device":   device_name,
+        "n":        n,
+        "scoring":  "readout_error + best_cx_error (lower = better). "
+                    "T1/T2 shown for context but not in score.",
+        "best_qubits": top_n,
+        "connectivity": {
+            "direct_links_between_top_qubits": connected_pairs,
+            "warning": disconnected_warning,
         },
-        indent=2,
-    )
+    }
+
+    return json.dumps(result, indent=2)
 
 
 # --------------------------------------------------------------------------
@@ -2917,6 +2948,391 @@ def route_job(
             "circuit_requires_qubits": required_qubits,
             "budget_max_minutes": max_minutes,
             "ibm_open_plan_note": "IBM Open Plan: 180 min/year. Each minute counts."
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: check_routing_overhead
+# --------------------------------------------------------------------------
+@mcp.tool()
+def check_routing_overhead(qubit_interactions: list, device_name: str = "ibm_marrakesh") -> str:
+    """
+    Predict routing overhead BEFORE submitting a circuit to IBM heavy-hex hardware.
+
+    IBM heavy-hex qubits allow max 3 direct connections each (degree ≤ 3).
+    If your circuit needs a qubit to talk to 4+ other qubits, the transpiler
+    must inject SWAP gates — each SWAP = 3 CX gates — causing gate count to
+    explode. We discovered this the hard way: 263 logical gates became 1,037
+    hardware gates because one qubit needed degree 4.
+
+    Args:
+        qubit_interactions: List of [qubit_a, qubit_b] pairs that need to
+            interact in your circuit. Example: [[0,1],[1,2],[0,3],[0,4]]
+            means qubit 0 talks to qubits 1, 3, and 4 (degree 3 — safe).
+        device_name: IBM backend to check against (default: ibm_marrakesh).
+
+    Returns:
+        Per-qubit degree, any degree violations, and an estimated gate inflation
+        factor. Degree ≤ 3 is safe. Degree 4 typically means ~4× gate inflation.
+    """
+    # Build adjacency: count unique neighbors per qubit
+    from collections import defaultdict
+    neighbors = defaultdict(set)
+    for pair in qubit_interactions:
+        if len(pair) != 2:
+            return json.dumps({"error": f"Each interaction must be [a, b], got: {pair}"})
+        a, b = int(pair[0]), int(pair[1])
+        neighbors[a].add(b)
+        neighbors[b].add(a)
+
+    HEAVY_HEX_MAX_DEGREE = 3  # IBM heavy-hex physical constraint
+    violations = []
+    qubit_report = []
+
+    for qubit, nbrs in sorted(neighbors.items()):
+        degree = len(nbrs)
+        excess = max(0, degree - HEAVY_HEX_MAX_DEGREE)
+        # Each excess degree ≈ 1 SWAP per gate = 3 extra CX per interaction
+        estimated_swaps = excess * 3
+        status = "OK" if excess == 0 else f"VIOLATION (degree {degree}, max {HEAVY_HEX_MAX_DEGREE})"
+        if excess > 0:
+            violations.append({
+                "qubit": qubit,
+                "degree": degree,
+                "excess": excess,
+                "estimated_extra_cx": estimated_swaps,
+            })
+        qubit_report.append({
+            "qubit":   qubit,
+            "degree":  degree,
+            "neighbors": sorted(nbrs),
+            "status":  status,
+        })
+
+    # Overall inflation estimate
+    total_excess_cx = sum(v["estimated_extra_cx"] for v in violations)
+    if violations:
+        inflation_warning = (
+            f"{len(violations)} qubit(s) exceed degree-{HEAVY_HEX_MAX_DEGREE} limit. "
+            f"Estimated ~{total_excess_cx} extra CX gates from SWAP injection. "
+            f"This can multiply your hardware gate count by 3–5×. "
+            f"Recommendation: redesign the circuit to eliminate degree-{HEAVY_HEX_MAX_DEGREE+1}+ nodes, "
+            f"or switch to an Ising Hamiltonian approach (encode_search_problem tool)."
+        )
+    else:
+        inflation_warning = (
+            "All qubits are within degree-3 limit. "
+            "No SWAP injection expected. Circuit should map cleanly to heavy-hex."
+        )
+
+    return json.dumps({
+        "device": device_name,
+        "heavy_hex_max_degree": HEAVY_HEX_MAX_DEGREE,
+        "verdict": "ROUTING RISK" if violations else "SAFE",
+        "summary": inflation_warning,
+        "violations": violations,
+        "qubit_degrees": qubit_report,
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool: encode_search_problem
+# --------------------------------------------------------------------------
+@mcp.tool()
+def encode_search_problem(
+    conditions: dict,
+    coupling_hints: list = [],
+    coupling_strength: float = 0.5,
+) -> str:
+    """
+    Convert a Boolean search problem into an Ising Hamiltonian ready for LNAA
+    (Lattice-Native Amplitude Amplification) on IBM hardware.
+
+    We derived this approach from scratch in Phase 5 of the Singmaster project
+    after Grover's algorithm hit IBM heavy-hex routing limits. Instead of a
+    Boolean oracle, encode target states as the lowest-energy (ground) states
+    of a magnetic system. IBM's RZ + RZZ gates implement this natively — zero
+    routing overhead.
+
+    How the math works:
+        H = Σ h_i × Z_i + Σ J_ij × Z_i × Z_j
+        Z_i = -1 if qubit i is 1, +1 if qubit i is 0.
+        To reward qubit i = 1: set h_i = +1  (because h × (-1) = -1 = low energy)
+        To reward qubit i = 0: set h_i = -1  (because h × (+1) = -1 = low energy)
+        To penalise pairs i,j being equal: J_ij = +0.5 (coupling hint)
+
+    Args:
+        conditions: dict mapping qubit index (as string) to desired value.
+            Example: {"1": 1, "2": 1, "3": 1, "4": 0, "5": 0}
+            means we want q1=q2=q3=1 and q4=q5=0.
+        coupling_hints: optional list of [i, j] pairs to add mild coupling
+            between qubits (useful to break degeneracy between near-equal targets).
+            Example: [[0, 6]] adds J_06 coupling.
+        coupling_strength: J value for coupling hints (default 0.5 = mild penalty).
+
+    Returns:
+        h_i coefficients, J_ij couplings, ground state energy, and a QAOA
+        circuit recipe with suggested starting parameters.
+    """
+    h_coeffs = {}
+    for qubit_str, desired_val in conditions.items():
+        q = int(qubit_str)
+        desired_val = int(desired_val)
+        if desired_val == 1:
+            # reward qubit=1 (spin=-1): need h×(-1) < 0, so h > 0
+            h_coeffs[q] = +1.0
+        elif desired_val == 0:
+            # reward qubit=0 (spin=+1): need h×(+1) < 0, so h < 0
+            h_coeffs[q] = -1.0
+        else:
+            return json.dumps({"error": f"Qubit {q} value must be 0 or 1, got {desired_val}"})
+
+    j_couplings = {}
+    for pair in coupling_hints:
+        if len(pair) != 2:
+            return json.dumps({"error": f"Each coupling hint must be [i, j], got: {pair}"})
+        i, j = int(pair[0]), int(pair[1])
+        j_couplings[(i, j)] = coupling_strength
+
+    # Compute ground state energy (what the target state achieves)
+    ground_energy = 0.0
+    for q, h in h_coeffs.items():
+        desired = int(conditions[str(q)])
+        spin = -1 if desired == 1 else +1  # Z_i = -1 if bit=1, +1 if bit=0
+        ground_energy += h * spin
+    for (i, j), J in j_couplings.items():
+        # Coupling contribution depends on whether the two qubits are same/different.
+        # With hints we assume no preference, so just note the range.
+        pass
+
+    # Build the circuit recipe
+    circuit_recipe = {
+        "step_1_superposition": "Apply H gate to all qubits (equal superposition)",
+        "step_2_phase_oracle": {
+            "rz_gates": {
+                f"q{q}": f"RZ(2 × {h:.1f} × gamma)" for q, h in h_coeffs.items()
+            },
+            "rzz_gates": {
+                f"q{i}_q{j}": f"RZZ(2 × {J:.1f} × gamma)" for (i, j), J in j_couplings.items()
+            } if j_couplings else "none",
+        },
+        "step_3_mixing": "Apply RX(2 × beta) to all qubits",
+        "step_4_repeat": "Repeat steps 2-3 for p layers (start with p=2)",
+        "step_5_measure": "Measure all qubits",
+        "suggested_starting_params": {
+            "gamma": 2.5,
+            "beta": 0.5,
+            "p_layers": 2,
+            "tip": "Sweep gamma in [0, π] and beta in [0, π/2] with 20 steps each to find optimal params",
+        },
+    }
+
+    return json.dumps({
+        "h_coefficients": {
+            f"q{q}": {"h_value": h, "meaning": f"rewards q{q}={int(conditions[str(q)])}"}
+            for q, h in h_coeffs.items()
+        },
+        "j_couplings": {
+            f"q{i}_q{j}": J for (i, j), J in j_couplings.items()
+        } if j_couplings else {},
+        "ground_state_energy": round(ground_energy, 3),
+        "energy_formula": "E = Σ h_i × Z_i  where Z_i = -1 if bit=1, +1 if bit=0",
+        "why_this_works": (
+            "Target states get the lowest energy (ground state). "
+            "Quantum walk naturally amplifies ground states. "
+            "RZ + RZZ gates are IBM-native — zero routing overhead on heavy-hex."
+        ),
+        "circuit_recipe": circuit_recipe,
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool: estimate_hardware_gates
+# --------------------------------------------------------------------------
+@mcp.tool()
+def estimate_hardware_gates(
+    logical_gates: int,
+    max_qubit_degree: int,
+    two_qubit_fraction: float = 0.4,
+) -> str:
+    """
+    Predict how many hardware gates your circuit will have after IBM transpilation.
+
+    Learned from the Singmaster project: the same circuit can go from 263 logical
+    gates to 1,037 hardware gates (4× inflation) if even ONE qubit exceeds the
+    heavy-hex degree-3 limit. This tool lets you predict that before wasting
+    queue time.
+
+    The key variable is max_qubit_degree — the highest number of other qubits
+    that any single qubit in your circuit needs to interact with directly.
+    On IBM heavy-hex this limit is 3. Above 3, every excess connection requires
+    SWAP injection (each SWAP = 3 extra CX gates).
+
+    Args:
+        logical_gates:       Total gates in your circuit before transpilation.
+        max_qubit_degree:    The highest degree of any qubit in your circuit's
+                             interaction graph (use check_routing_overhead to find this).
+        two_qubit_fraction:  Fraction of logical gates that are 2-qubit gates
+                             (default 0.4 = 40%, typical for Grover-style circuits).
+
+    Returns:
+        Predicted hardware gate count, inflation factor, and whether you are
+        above or below the ~600-gate hardware noise floor on ibm_marrakesh.
+    """
+    HEAVY_HEX_MAX_DEGREE = 3
+    NOISE_FLOOR_GATES = 600  # empirical from Phase 3-5 experiments
+
+    two_qubit_gates = int(logical_gates * two_qubit_fraction)
+    single_qubit_gates = logical_gates - two_qubit_gates
+
+    # Inflation model: each degree over the limit adds ~3 CX per interaction
+    excess_degree = max(0, max_qubit_degree - HEAVY_HEX_MAX_DEGREE)
+
+    if excess_degree == 0:
+        inflation_factor = 1.1  # small overhead from native gate decomposition
+        method = "No SWAP injection needed. Minor decomposition overhead only."
+    elif excess_degree == 1:
+        inflation_factor = 4.0  # observed: 263 → 1037 in Phase 4v2
+        method = "Degree-4 node detected. Heavy SWAP injection expected (~4× inflation)."
+    else:
+        inflation_factor = 4.0 + (excess_degree - 1) * 2.5
+        method = f"Degree-{max_qubit_degree} node detected. Severe routing overhead."
+
+    predicted_hw_gates = int(logical_gates * inflation_factor)
+    above_noise_floor = predicted_hw_gates > NOISE_FLOOR_GATES
+
+    verdict = "DANGER" if above_noise_floor else "OK"
+    advice = ""
+    if above_noise_floor and excess_degree > 0:
+        advice = (
+            f"Circuit will likely collapse to noise. "
+            f"Redesign to eliminate degree-{max_qubit_degree} qubits. "
+            f"Consider encode_search_problem to switch to Ising Hamiltonian approach "
+            f"(RZZ+RX gates need no routing — logical ≈ hardware gate count)."
+        )
+    elif above_noise_floor:
+        advice = (
+            f"Circuit is large but routing is clean. "
+            f"Try optimization level 2-3 with seed sweep (opt=2 seed=42 works well). "
+            f"Oracle simplification (shared Boolean conditions) can cut 30-50%."
+        )
+    else:
+        advice = "Circuit is within hardware noise floor. Should be executable."
+
+    return json.dumps({
+        "input": {
+            "logical_gates": logical_gates,
+            "max_qubit_degree": max_qubit_degree,
+            "two_qubit_fraction": two_qubit_fraction,
+        },
+        "prediction": {
+            "inflation_factor": round(inflation_factor, 1),
+            "predicted_hardware_gates": predicted_hw_gates,
+            "heavy_hex_noise_floor": NOISE_FLOOR_GATES,
+            "above_noise_floor": above_noise_floor,
+            "verdict": verdict,
+        },
+        "method": method,
+        "advice": advice,
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool: get_amplification
+# --------------------------------------------------------------------------
+@mcp.tool()
+def get_amplification(
+    job_id: str,
+    marked_bitstrings: list,
+    search_space_size: int,
+) -> str:
+    """
+    Compute the amplification factor from a completed quantum search job.
+
+    Amplification = (fraction of shots on marked states) / (random baseline)
+    Random baseline = len(marked_bitstrings) / search_space_size
+
+    A value of 1.0 means no better than random. Above 1.0 means the quantum
+    search worked. In our Singmaster experiments: Phase 3v3 got 4.17×,
+    Phase 5 LNAA got 27.78×.
+
+    Args:
+        job_id:              IBM job ID of a completed measurement job.
+        marked_bitstrings:   List of bitstrings (as strings) representing your
+                             target states. Example: ["0001110", "0001111", "1001110"]
+                             These must match Qiskit's bit ordering (classical bit 0
+                             = rightmost character).
+        search_space_size:   Total number of possible states. For n qubits: 2^n.
+                             For 7 qubits: 128. For 4 qubits: 16.
+
+    Returns:
+        Amplification factor, shot breakdown per marked state, and a comparison
+        to the uniform random baseline.
+    """
+    try:
+        service = _get_service()
+        job = service.job(job_id)
+
+        if job.status().name not in ("DONE", "COMPLETED"):
+            return json.dumps({
+                "error": f"Job {job_id} is not complete yet. Status: {job.status().name}",
+                "tip": "Wait for job to finish, then call get_amplification again.",
+            })
+
+        result = job.result()
+        pub_result = result[0]
+        data = pub_result.data
+        field = list(vars(data).keys())[0]
+        counts = getattr(data, field).get_counts()
+
+        total_shots = sum(counts.values())
+        marked_set = set(marked_bitstrings)
+
+        # Count shots on marked states
+        marked_counts = {}
+        marked_total = 0
+        for bits, count in counts.items():
+            if bits in marked_set:
+                marked_counts[bits] = count
+                marked_total += count
+
+        # Amplification calculation
+        marked_fraction = marked_total / total_shots
+        random_baseline = len(marked_bitstrings) / search_space_size
+        amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+        # Top states overall (for context)
+        top_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        return json.dumps({
+            "job_id": job_id,
+            "total_shots": total_shots,
+            "search_space_size": search_space_size,
+            "marked_bitstrings": marked_bitstrings,
+            "random_baseline_fraction": round(random_baseline, 5),
+            "marked_shots": {
+                bits: {
+                    "count": marked_counts.get(bits, 0),
+                    "fraction": round(marked_counts.get(bits, 0) / total_shots, 4),
+                }
+                for bits in marked_bitstrings
+            },
+            "marked_total_shots": marked_total,
+            "marked_fraction": round(marked_fraction, 4),
+            "amplification_factor": amplification,
+            "verdict": (
+                "EXCELLENT (>10×)" if amplification > 10 else
+                "GOOD (4–10×)"     if amplification > 4  else
+                "WEAK (1–4×)"      if amplification > 1  else
+                "FAILED (≤1×, no better than random)"
+            ),
+            "top_10_states": [
+                {"bits": b, "count": c, "fraction": round(c / total_shots, 4), "marked": b in marked_set}
+                for b, c in top_states
+            ],
         }, indent=2)
 
     except Exception as e:
