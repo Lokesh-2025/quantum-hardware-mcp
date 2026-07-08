@@ -33,7 +33,8 @@ Tools:
   - encode_search_problem : convert Boolean conditions into Ising h_i / J_ij for LNAA circuits
   - estimate_hardware_gates: predict transpiled gate count from logical gates + qubit degree
   - get_amplification     : compute amplification factor from a completed search job
-  - run_search_experiment : ONE CALL does everything — encode → build circuit → pick best machine → submit → amplification
+  - run_search_experiment    : ONE CALL does everything — encode → build circuit → pick best machine → submit → amplification
+  - encode_collision_problem : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
 """
 
 import os
@@ -3334,6 +3335,175 @@ def get_amplification(
                 {"bits": b, "count": c, "fraction": round(c / total_shots, 4), "marked": b in marked_set}
                 for b, c in top_states
             ],
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: encode_collision_problem
+# --------------------------------------------------------------------------
+@mcp.tool()
+def encode_collision_problem(
+    k1: int,
+    k2: int,
+    max_n1: int = 50,
+    max_n2: int = 30,
+) -> str:
+    """
+    Find all pairs (n1, n2) where C(n1,k1) = C(n2,k2) classically,
+    then encode those collision pairs as Ising h_i coefficients ready
+    for run_search_experiment.
+
+    Why this matters:
+      Instead of telling LNAA "look at row 14, 15, 78", we tell it
+      "find coordinate pairs that collide" — and it discovers them.
+      That's the generalization from Phase 5.
+
+    Strategy:
+      - Represent n1 in binary as qubits q0..q(b1-1)
+      - Represent n2 in binary as qubits q(b1)..q(b1+b2-1)
+      - For each known collision pair (n1_sol, n2_sol), reward the
+        exact bit pattern with positive h_i (1 → reward, 0 → penalize)
+      - Multiple solutions share the same qubit register — LNAA
+        amplifies all ground states simultaneously.
+
+    Example:
+      k1=2, k2=3, max_n1=20, max_n2=15
+      → finds C(16,2)=C(10,3)=120
+      → encodes bit patterns of n1=16 and n2=10
+
+    Args:
+      k1      : column fixed for register 1 (e.g. 2 → triangular numbers)
+      k2      : column fixed for register 2 (e.g. 3 → tetrahedral numbers)
+      max_n1  : search n1 from k1 to max_n1
+      max_n2  : search n2 from k2 to max_n2
+
+    Returns JSON with:
+      - collisions        : list of (n1, n2, value) found
+      - num_qubits        : total qubits needed
+      - h_coeffs          : Ising h_i per qubit (pass to run_search_experiment)
+      - marked_states     : bit-strings of collision pairs (for get_amplification)
+      - run_search_params : ready-to-use kwargs for run_search_experiment
+    """
+    try:
+        from math import comb, ceil, log2
+
+        # ── 1. Classical collision search ──────────────────────────────────
+        # Build lookup: value → list of n for register 1
+        table1 = {}
+        for n in range(k1, max_n1 + 1):
+            v = comb(n, k1)
+            table1.setdefault(v, []).append(n)
+
+        # Build lookup: value → list of n for register 2
+        table2 = {}
+        for n in range(k2, max_n2 + 1):
+            v = comb(n, k2)
+            table2.setdefault(v, []).append(n)
+
+        # Intersect to find collisions
+        collisions = []
+        for v in sorted(set(table1) & set(table2)):
+            for n1 in table1[v]:
+                for n2 in table2[v]:
+                    collisions.append({"n1": n1, "n2": n2, "value": v})
+
+        if not collisions:
+            return json.dumps({
+                "collisions": [],
+                "message": f"No collisions found for C(n,{k1})=C(m,{k2}) in the given range."
+            })
+
+        # ── 2. Decide qubit widths ─────────────────────────────────────────
+        # bits needed to represent max_n1 and max_n2
+        bits1 = max(1, ceil(log2(max_n1 + 1)))
+        bits2 = max(1, ceil(log2(max_n2 + 1)))
+        num_qubits = bits1 + bits2
+
+        # ── 3. Build Ising h_i from collision bit patterns ─────────────────
+        # For each collision solution, the bit patterns of n1 and n2 are
+        # "good states". We sum the rewards across all solutions, then
+        # normalise so no single h_i dominates.
+        #
+        # Convention: qubit i → h_i = +1 means "reward bit=1 here"
+        #                         h_i = -1 means "reward bit=0 here"
+        # We aggregate votes across all collision solutions.
+
+        h_votes = [0] * num_qubits   # positive = more solutions have bit=1 here
+
+        for col in collisions:
+            n1, n2 = col["n1"], col["n2"]
+            # register 1: qubits 0..bits1-1 (LSB first)
+            for i in range(bits1):
+                bit = (n1 >> i) & 1
+                h_votes[i] += 1 if bit == 1 else -1
+            # register 2: qubits bits1..bits1+bits2-1
+            for i in range(bits2):
+                bit = (n2 >> i) & 1
+                h_votes[bits1 + i] += 1 if bit == 1 else -1
+
+        # Convert votes to ±1 h coefficients
+        h_coeffs = {}
+        for i, v in enumerate(h_votes):
+            if v != 0:
+                h_coeffs[str(i)] = 1.0 if v > 0 else -1.0
+            # qubits with zero net vote get no h term → neutral
+
+        # ── 4. Build marked_states list for get_amplification ──────────────
+        marked_states = []
+        for col in collisions:
+            n1, n2 = col["n1"], col["n2"]
+            # build full bit-string: register1 (bits1 wide) | register2 (bits2 wide)
+            # LSB-first within each register, register1 at lower qubit indices
+            bits = []
+            for i in range(bits1):
+                bits.append(str((n1 >> i) & 1))
+            for i in range(bits2):
+                bits.append(str((n2 >> i) & 1))
+            marked_states.append("".join(bits))
+
+        # ── 5. Describe each qubit so experiments are readable ────────────
+        qubit_map = {}
+        for i in range(bits1):
+            qubit_map[str(i)] = f"n1 bit {i} (2^{i}={2**i})"
+        for i in range(bits2):
+            qubit_map[str(bits1 + i)] = f"n2 bit {i} (2^{i}={2**i})"
+
+        # ── 6. Ready-to-use params for run_search_experiment ──────────────
+        run_params = {
+            "conditions": {
+                "description": f"Find n1,n2 where C(n1,{k1})=C(n2,{k2})",
+                "k1": k1, "k2": k2,
+                "max_n1": max_n1, "max_n2": max_n2,
+            },
+            "num_qubits": num_qubits,
+            "marked_rows": marked_states,
+            "shots": 4096,
+            "p_layers": 2,
+            "gamma": 2.589,
+            "beta": 0.501,
+            "simulate_only": True,
+        }
+        # Pass h_coeffs as coupling hints via conditions
+        run_params["conditions"]["h_coeffs"] = h_coeffs
+
+        return json.dumps({
+            "collisions": collisions,
+            "num_collision_pairs": len(collisions),
+            "num_qubits": num_qubits,
+            "bits_register_1": bits1,
+            "bits_register_2": bits2,
+            "qubit_map": qubit_map,
+            "h_coeffs": h_coeffs,
+            "marked_states": marked_states,
+            "run_search_params": run_params,
+            "validation_hint": (
+                f"Ground truth: C({collisions[0]['n1']},{k1}) = "
+                f"C({collisions[0]['n2']},{k2}) = {collisions[0]['value']}"
+                if collisions else ""
+            ),
         }, indent=2)
 
     except Exception as e:
