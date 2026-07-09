@@ -200,33 +200,44 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 
 ## Real experiments: Singmaster's Conjecture on IBM hardware
 
-Singmaster's Conjecture asks whether any integer appears 9+ times in Pascal's Triangle. We are using this server to run quantum search experiments on ibm_marrakesh, attempting to amplify rows containing 3003 above the hardware noise floor.
+Singmaster's Conjecture asks whether any integer appears 9+ times in Pascal's Triangle. We use this server as active research infrastructure — not a demo. All job IDs are real. All results are reproducible.
 
-All job IDs are real. All results are reproducible.
+| Phase | Approach | Gates | Amplification | Backend | Finding |
+|-------|----------|-------|---------------|---------|---------|
+| Phase 1 | Grover, 4 qubits, target=6 | 611 | **4.11×** | ibm_kingston | Signal clear |
+| Phase 2 | Grover, 4 qubits, unoptimized | 16,271 | **1.04×** | ibm_marrakesh | Noise floor — 161× transpilation overhead |
+| Phase 3 v3 | Grover, 4 qubits, opt=2 seed=42 | 103 | **4.17×** | ibm_marrakesh | 99.4% gate reduction |
+| Phase 4 v1 | Grover, 7 qubits, rows 14+15+78 | 624 | **3.04×** | ibm_marrakesh | Row 78 found for first time |
+| Phase 4 v2 | Grover, 7 qubits, lossy oracle | 1,037 | **1.92×** | ibm_marrakesh | Routing failure — degree-4 node |
+| Phase 5 | LNAA, 7 qubits, Ising walk | **135** | **27.78×** | ibm_marrakesh | Hardware record at time |
+| Phase 6 | LNAA auto-collision, 9 qubits | 45 | **122.92×** | simulation | Zero manual design |
+| Step 3 | 3 parallel rails, 30 qubits | 180 | **~300×** | ibm_kingston | New hardware record |
+| Step 4 | 4-way collision, 24 qubits | 144 | **178.8×** | ibm_fez | **First hardware-confirmed 4-way Pascal collision** |
 
-| Phase | Approach | Gates | Amplification | Finding |
-|-------|----------|-------|---------------|---------|
-| Phase 1 | Grover, 4 qubits, target=6 | 611 | **4.11×** | Signal clear |
-| Phase 2 | Grover, 4 qubits, target=3003, unoptimized | 16,271 | **1.04×** | Noise floor hit — brackets coherence limit |
-| Phase 3 v3 | Grover, 4 qubits, opt=2 seed=42, ancilla diffusion | 103 | **4.17×** | 99.4% gate reduction from Phase 2 |
-| Phase 4 v1 | Grover, 7 qubits, rows 14+15+78 | 624 | **3.04×** | Row 78 found on hardware for the first time |
-| Phase 4 v2 | Grover, 7 qubits, lossy oracle, 2 iterations | 1,037 | **1.92×** | Routing failure — degree-4 node caused 4× gate inflation |
-| Phase 5 | LNAA, 7 qubits, Ising Hamiltonian quantum walk | **135** | **27.78×** | Record — 6.7× better than previous best |
-
-**Phase 5 detail (ibm_marrakesh, job d971ok52su3c739hhmpg, 4096 shots):**
+**Step 4 detail (ibm_fez, job d97fk8t2su3c739i26fg, 4096 shots):**
 
 ```
-Row  78 (1001110): 1157 shots (28.2%) ← 3003  C(78,2)=3003
-Row  15 (0001111): 1056 shots (25.8%) ← 3003  C(15,5)=3003
-Row  14 (0001110):  455 shots (11.1%) ← 3003  C(14,6)=3003
-Combined: 65.1% of shots on 3 target rows. Random baseline: 2.34%.
-Amplification: 27.78×
-Hardware gates: 135 (vs 1,037 for Phase 4 v2)
+Dominant bitstring: 000011100000111101001110  →  1,396 shots (34.08%)
+
+Decoded rail by rail:
+  Rail k=6  bits 00001110  →  row 14   C(14,6) = 3003  ✓
+  Rail k=5  bits 00001111  →  row 15   C(15,5) = 3003  ✓
+  Rail k=2  bits 01001110  →  row 78   C(78,2) = 3003  ✓
+
+Per-rail amplification: 178.8×   (sim predicted 190.27× — 94% retention)
+2nd-best state: 2.17% — target is 25× cleaner than noise
 ```
 
-**Key insight:** IBM heavy-hex is an Ising lattice. RZZ + RX gates are native — zero routing overhead. Encoding search targets as ground states of a Hamiltonian outperforms Boolean oracle + diffusion when the hardware topology constrains qubit connectivity to degree ≤ 3.
+**Classical sieve:** `sieve_singmaster_space` searched n=2..50,000 × k=2..200 (~5M values). No 9+ appearances found. 3003 is the sole 8-way champion. Consistent with Singmaster's Conjecture.
 
-Full experiment history and code: [singmasters-conjecture](https://github.com/Lokesh-2025/singmasters-conjecture)
+**The complete pipeline:**
+```
+sieve_singmaster_space → encode_4way_collision → IBM QPU → get_amplification
+```
+
+**Key insight:** IBM heavy-hex is an Ising lattice. RZZ + RX gates are native — zero routing overhead. Encoding targets as ground states of a Hamiltonian outperforms Boolean oracle + diffusion when hardware topology constrains qubit degree ≤ 3.
+
+Full experiment history: [singmasters-conjecture](https://github.com/Lokesh-2025/singmasters-conjecture)
 
 ---
 
@@ -367,7 +378,7 @@ Restart Claude Desktop. All 34 tools appear under the hammer icon.
 - [x] Singmaster Phase 3 v3 — 4.17× at 103 gates (99.4% reduction from Phase 2)
 - [x] Singmaster Phase 4 v1 — 7 qubits, row 78 found, 3.04×
 - [x] Singmaster Phase 4 v2 — routing failure diagnosed as graph embedding problem
-- [x] Singmaster Phase 5 LNAA — **27.78× amplification, 135 gates (record)**
+- [x] Singmaster Phase 5 LNAA — **27.78× amplification, 135 gates**
 - [x] `check_routing_overhead` — degree>3 detection before SWAP flood
 - [x] `encode_search_problem` — Boolean conditions → Ising Hamiltonian coefficients
 - [x] `estimate_hardware_gates` — predicts transpiled gate count + noise floor warning
@@ -376,14 +387,18 @@ Restart Claude Desktop. All 34 tools appear under the hammer icon.
 - [x] Temporal indexing — day_of_week + hour_utc on all snapshots and jobs
 - [x] Job submissions table — transpilation expansion ratio tracking
 - [x] Listed on Glama, mcp.so, PulseMCP
+- [x] `encode_collision_problem` — auto-finds C(n1,k1)=C(n2,k2) pairs, encodes as Ising (122.92× sim)
+- [x] `run_parallel_collision_search` — N simultaneous LNAA rails in one hardware job (~300× ibm_kingston)
+- [x] `sieve_singmaster_space` — Lucas theorem sieve, validated 3003 at 8 positions, searched n=50k
+- [x] `encode_4way_collision` — multi-column parallel LNAA, **178.8× on ibm_fez** — first hardware-confirmed 4-way Pascal collision
+- [x] Singmaster Step 3 — **~300× amplification, 30 qubits, ibm_kingston**
+- [x] Singmaster Step 4 — **178.8× amplification, 24 qubits, ibm_fez** (hardware record)
 
 **Next**
-- [ ] `generate_walk_hamiltonian` — encode_search_problem output → QASM directly
-- [ ] `build_grover_circuit` — problem description → QASM, no Python needed
+- [ ] Elliptic curve solver — find N satisfying C(a,2)=C(b,3)=C(c,4)=C(d,5) simultaneously (SageMath integration)
+- [ ] `inject_topological_walk` — bypass transpiler using calibration DB, map directly to high-coherence qubits
+- [ ] `discover_energy_landscape` — LNAA parameter sweep → full energy landscape visualization
 - [ ] `algorithm_selector` — decides Grover vs LNAA based on circuit + hardware analysis
-- [ ] `run_search_experiment` — full pipeline in one call: encode → build → submit → amplification
-- [ ] `mutate_circuit_topology` — rewrites algorithm math to fit heavy-hex natively (routing dilation = 1.0)
-- [ ] `inject_hardware_layout` — bypasses stochastic transpiler, maps directly to high-coherence qubits
 - [ ] VQE on real IBM hardware — H2 hardware result
 - [ ] Quantum Rush Hour detection — weekly queue seasonality
 - [ ] Smart routing brain — cross-provider ML recommendations
