@@ -4165,18 +4165,12 @@ def run_parallel_collision_search(
 
         # ── 3. Simulate or submit ─────────────────────────────────────────
         if simulate_only:
+            # Run directly on AerSimulator — skip pass manager to avoid
+            # HighLevelSynthesis choking on measurement gates in multi-rail circuits
             from qiskit_aer import AerSimulator
-            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
             sim = AerSimulator()
-            sim_pm = _gpm(optimization_level=1, backend=sim)
-            sim_qc = sim_pm.run(qc)
-            from qiskit_aer.primitives import SamplerV2 as AerSampler
-            aer_sampler = AerSampler()
-            result = aer_sampler.run([sim_qc], shots=shots).result()
-            pub = result[0]
-            data = pub.data
-            field = list(vars(data).keys())[0]
-            counts = getattr(data, field).get_counts()
+            job = sim.run(qc, shots=shots)
+            counts = job.result().get_counts()
         else:
             from qiskit_ibm_runtime import QiskitRuntimeService
             from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
