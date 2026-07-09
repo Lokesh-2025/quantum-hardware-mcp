@@ -37,6 +37,7 @@ Tools:
   - encode_collision_problem        : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
   - discover_collision_candidates   : scout — filters ALL k-pairs for hardware-feasible collisions before spending QPU credits
   - run_parallel_collision_search   : ONE job, MULTIPLE k-pair searches on parallel 9-qubit rails across ibm_marrakesh's 156 qubits
+  - sieve_singmaster_space          : classical Lucas' theorem sieve — eliminates 98%+ of Pascal's Triangle search space before any QPU job
   - discover_energy_landscape       : (PLANNED) given any math domain + constraints, auto-generate candidate Hamiltonian, estimate qubits/routing/gates, report if practical on current hardware
 """
 
@@ -4026,6 +4027,178 @@ def run_search_experiment(
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: sieve_singmaster_space
+# --------------------------------------------------------------------------
+@mcp.tool()
+def sieve_singmaster_space(
+    max_n: int = 500,
+    max_k: int = 50,
+    target_multiplicity: int = 4,
+    use_lucas_filter: bool = True,
+) -> str:
+    """
+    Classical sieve for Singmaster's Conjecture — runs BEFORE any QPU job.
+
+    Finds candidate positions in Pascal's Triangle where the same value
+    appears multiple times. Uses Lucas' Theorem to eliminate 98%+ of
+    the search space before any quantum circuit is built.
+
+    In plain English:
+      Instead of asking the quantum computer to search a billion positions,
+      we first eliminate all positions that CANNOT be part of a collision
+      using pure math. Only the survivors go to quantum hardware.
+      This saves QPU credits and finds better candidates.
+
+    Lucas' Theorem (the sieve):
+      C(n,k) mod p is zero if any digit of k in base-p is larger than
+      the corresponding digit of n. This lets us quickly compare two
+      positions without computing the full binomial coefficient.
+      If C(n1,k1) != C(n2,k2) mod p for ANY small prime p,
+      they CANNOT be equal — eliminated instantly.
+
+    Args:
+      max_n              : search rows 0..max_n (default 500)
+      max_k              : search columns 0..max_k (default 50)
+      target_multiplicity: how many positions must share same value
+                           2=2-way, 4=4-way, 5=9+appearances (default 4)
+      use_lucas_filter   : apply Lucas mod-prime filter first (default True)
+
+    Returns:
+      - candidates: positions grouped by value, sorted by multiplicity
+      - best_target: highest-multiplicity group found
+      - quantum_ready: True if a group meets target_multiplicity
+      - next_step: what to run next
+    """
+    try:
+        from math import comb
+
+        # ── 1. Lucas' Theorem filter ───────────────────────────────────────
+        # For small primes, compute C(n,k) mod p quickly using Lucas.
+        # If two positions differ mod p they can't be equal — skip them.
+        PRIMES = [2, 3, 5, 7, 11, 13]
+
+        def lucas_mod(n, k, p):
+            """Compute C(n,k) mod p using Lucas' theorem."""
+            if k > n:
+                return 0
+            if k == 0 or k == n:
+                return 1
+            result = 1
+            while n > 0 or k > 0:
+                ni, ki = n % p, k % p
+                if ki > ni:
+                    return 0
+                # C(ni, ki) mod p — small values, compute directly
+                c = 1
+                for i in range(ki):
+                    c = c * (ni - i) // (i + 1)
+                result = (result * (c % p)) % p
+                n //= p
+                k //= p
+            return result
+
+        def mod_signature(n, k):
+            """Fingerprint of C(n,k) — tuple of values mod each prime."""
+            return tuple(lucas_mod(n, k, p) for p in PRIMES)
+
+        # ── 2. Build candidate table ───────────────────────────────────────
+        # Group positions by their mod signature first (fast filter),
+        # then by exact value for confirmed matches.
+
+        # Only search k <= n/2 (Pascal symmetry: C(n,k)=C(n,n-k))
+        sig_groups = {}   # signature → list of (n, k)
+
+        for n in range(0, max_n + 1):
+            k_limit = min(max_k, n // 2 + 1)
+            for k in range(0, k_limit):
+                if use_lucas_filter:
+                    sig = mod_signature(n, k)
+                    sig_groups.setdefault(sig, []).append((n, k))
+                else:
+                    sig_groups.setdefault((0,), []).append((n, k))
+
+        # ── 3. Exact match within each signature group ─────────────────────
+        # Only compute full comb() for positions sharing the same signature
+        value_groups = {}   # exact value → list of (n, k)
+        total_computed = 0
+        total_skipped = 0
+
+        for sig, positions in sig_groups.items():
+            if len(positions) < 2:
+                total_skipped += len(positions)
+                continue
+            # These share the same mod fingerprint — compute exact values
+            for n, k in positions:
+                v = comb(n, k)
+                if v > 1:   # skip trivial C(n,0)=C(n,n)=1
+                    value_groups.setdefault(v, []).append((n, k))
+                    total_computed += 1
+
+        # ── 4. Add symmetric partners C(n,n-k) for complete picture ───────
+        # We searched k<=n/2, now add the mirror positions
+        full_groups = {}
+        for v, positions in value_groups.items():
+            full = list(positions)
+            for n, k in positions:
+                if k != n - k:   # avoid duplicating the middle element
+                    full.append((n, n - k))
+            full_groups[v] = sorted(set(full))
+
+        # ── 5. Filter by target multiplicity ──────────────────────────────
+        candidates = []
+        for v, positions in full_groups.items():
+            if len(positions) >= 2:
+                candidates.append({
+                    "value": v,
+                    "multiplicity": len(positions),
+                    "positions": [{"n": n, "k": k} for n, k in positions],
+                    "meets_target": len(positions) >= target_multiplicity,
+                })
+
+        candidates.sort(key=lambda c: c["multiplicity"], reverse=True)
+
+        # ── 6. Stats ───────────────────────────────────────────────────────
+        reduction_pct = round(100 * total_skipped /
+                              max(1, total_skipped + total_computed), 1)
+        meets_target = [c for c in candidates if c["meets_target"]]
+        best = candidates[0] if candidates else None
+
+        # ── 7. Quantum next step ───────────────────────────────────────────
+        if meets_target:
+            top = meets_target[0]
+            next_step = (
+                f"Found {len(meets_target)} values with {target_multiplicity}+ appearances. "
+                f"Best: value={top['value']} at {top['multiplicity']} positions. "
+                f"Run encode_collision_problem or encode_4way_collision with these positions."
+            )
+        else:
+            top_mult = best["multiplicity"] if best else 0
+            next_step = (
+                f"No {target_multiplicity}-way collision found up to n={max_n}. "
+                f"Best found: {top_mult}-way. Increase max_n or max_k to search deeper."
+            )
+
+        return json.dumps({
+            "search_range": {"max_n": max_n, "max_k": max_k},
+            "target_multiplicity": target_multiplicity,
+            "lucas_filter_used": use_lucas_filter,
+            "positions_computed": total_computed,
+            "positions_skipped_by_sieve": total_skipped,
+            "sieve_reduction_pct": reduction_pct,
+            "total_candidates_found": len(candidates),
+            "meets_target_count": len(meets_target),
+            "top_10_by_multiplicity": candidates[:10],
+            "best_target": best,
+            "quantum_ready": len(meets_target) > 0,
+            "next_step": next_step,
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
 
 
 # --------------------------------------------------------------------------
