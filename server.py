@@ -3281,9 +3281,11 @@ def get_amplification(
         service = _get_service()
         job = service.job(job_id)
 
-        if job.status().name not in ("DONE", "COMPLETED"):
+        raw_status = job.status()
+        status_str = raw_status if isinstance(raw_status, str) else raw_status.name
+        if status_str.upper() not in ("DONE", "COMPLETED"):
             return json.dumps({
-                "error": f"Job {job_id} is not complete yet. Status: {job.status().name}",
+                "error": f"Job {job_id} is not complete yet. Status: {status_str}",
                 "tip": "Wait for job to finish, then call get_amplification again.",
             })
 
