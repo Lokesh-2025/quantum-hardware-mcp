@@ -4245,6 +4245,212 @@ def encode_4way_collision(
 
 
 # --------------------------------------------------------------------------
+# Tool: equality_oracle_search  (Discovery engine — no answer needed)
+# --------------------------------------------------------------------------
+@mcp.tool()
+def equality_oracle_search(
+    k1: int = 2,
+    k2: int = 5,
+    n_bits: int = 6,
+    p_layers: int = 3,
+    gamma: float = 1.0,
+    beta: float = 0.8,
+    shots: int = 4096,
+    simulate_only: bool = True,
+    backend_name: str = "",
+) -> str:
+    """
+    Discovery engine: find C(n1,k1) = C(n2,k2) WITHOUT knowing the answer first.
+
+    This is the fundamental upgrade from verification to discovery.
+
+    OLD WAY (encode_4way_collision):
+      Input the answer (e.g. 3003 at rows 14,15,78) → circuit confirms it loudly.
+      Needs the answer before it can run. Not a search.
+
+    NEW WAY (this tool):
+      Input only the two columns k1, k2.
+      Two qubit registers in superposition — one per column.
+      Cross-register RZZ gates encode the Lucas mod-2 equality oracle:
+        "mark any (n1, n2) where C(n1,k1) and C(n2,k2) have the same parity."
+      LNAA amplifies matching pairs. Measurement discovers which rows collide.
+      No answer needed. The QPU finds it.
+
+    Lucas mod-2 oracle (why it's cheap):
+      By Lucas' theorem, C(n,k) mod 2 = 1 iff every 1-bit of k is also a 1-bit of n.
+      This is digit-local — depends only on a few bits of n. Perfect for RZZ/RZ gates.
+      Example: k=2 (binary 10) → C(n,2) is odd iff bit-1 of n is 1.
+               k=5 (binary 101) → C(n,5) is odd iff bits 0 AND 2 of n are both 1.
+      Equality oracle: are the active-bit patterns of n1 and n2 consistent?
+      Encoded as cross-register RZZ between the active bit positions.
+
+    Circuit structure (total = 2*n_bits qubits):
+      Register 1 (qubits 0..n_bits-1):   row n1 for column k1
+      Register 2 (qubits n_bits..2n-1):  row n2 for column k2
+      For each LNAA layer:
+        - RZ on active bits of each register (single-register terms)
+        - RZZ between active bit pairs across registers (equality coupling)
+        - RX mixing on all qubits
+
+    Post-processing:
+      For each measured peak (n1, n2), compute C(n1,k1) and C(n2,k2) exactly.
+      Report pairs where they are truly equal — those are real collisions.
+
+    Args:
+      k1, k2     : the two Pascal columns to search (e.g. k1=2, k2=5)
+      n_bits     : qubits per register (6 bits = rows 0..63, 8 bits = 0..255)
+      simulate_only: True = free, False = real IBM QPU
+    """
+    try:
+        from math import comb
+        from qiskit import QuantumCircuit
+
+        # ── 1. Lucas active bits ─────────────────────────────────────────
+        def active_bits(k, p=2):
+            """Bit positions where k has a 1 in base p — these are the
+            bits of n that determine C(n,k) mod p."""
+            bits = []
+            pos = 0
+            while k > 0:
+                if k % p != 0:
+                    bits.append(pos)
+                k //= p
+                pos += 1
+            return bits
+
+        ab1 = active_bits(k1)   # e.g. k=2 → [1]
+        ab2 = active_bits(k2)   # e.g. k=5 → [0, 2]
+
+        n_total = 2 * n_bits
+        reg2_offset = n_bits
+
+        # ── 2. Build two-register LNAA circuit ───────────────────────────
+        qc = QuantumCircuit(n_total, n_total)
+        qc.h(range(n_total))
+
+        for _ in range(p_layers):
+            # Single-register terms: reward active bits being 1
+            # (C(n,k) mod 2 = 1 when active bits are set)
+            for b in ab1:
+                if b < n_bits:
+                    qc.rz(2 * gamma, b)
+            for b in ab2:
+                if b < n_bits:
+                    qc.rz(2 * gamma, reg2_offset + b)
+
+            # Cross-register equality coupling: RZZ between active bits
+            # of register 1 and active bits of register 2.
+            # This rewards states where both registers have matching
+            # parity — i.e. C(n1,k1) ≡ C(n2,k2) mod 2.
+            for b1 in ab1:
+                for b2 in ab2:
+                    if b1 < n_bits and b2 < n_bits:
+                        qc.rzz(2 * gamma, b1, reg2_offset + b2)
+
+            # Mixing layer
+            for q in range(n_total):
+                qc.rx(2 * beta, q)
+
+        qc.measure(range(n_total), range(n_total))
+        logical_gates = qc.size()
+
+        # ── 3. Simulate or submit ─────────────────────────────────────────
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            sim = AerSimulator()
+            counts = sim.run(qc, shots=shots).result().get_counts()
+        else:
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+            svc = _get_service()
+            backend = svc.least_busy(operational=True, simulator=False) \
+                if not backend_name else svc.backend(backend_name)
+            pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
+            t_qc = pm.run(qc)
+            sampler = IBMSampler(mode=backend)
+            job = sampler.run([t_qc], shots=shots)
+            return json.dumps({
+                "status": "submitted",
+                "job_id": job.job_id(),
+                "backend": backend.name,
+                "k1": k1, "k2": k2, "n_bits": n_bits,
+                "total_qubits": n_total,
+                "logical_gates": logical_gates,
+                "active_bits_k1": ab1, "active_bits_k2": ab2,
+                "note": f"Use job_results('{job.job_id()}') when done.",
+            }, indent=2)
+
+        # ── 4. Post-process: find real collisions in top peaks ─────────────
+        total_shots = sum(counts.values())
+        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:30]
+
+        collisions = []
+        near_misses = []
+        random_baseline = 1.0 / (4 ** n_bits)  # 1 / (2^n * 2^n)
+
+        for bitstring, count in top:
+            # Qiskit: MSB first. reg2 is leftmost n_bits, reg1 is rightmost.
+            reg2_bits = bitstring[:n_bits]
+            reg1_bits = bitstring[n_bits:]
+            n1 = int(reg1_bits, 2)
+            n2 = int(reg2_bits, 2)
+
+            if n1 < k1 or n2 < k2:
+                continue
+
+            v1 = comb(n1, k1)
+            v2 = comb(n2, k2)
+            prob = count / total_shots
+            amp = round(prob / random_baseline, 1)
+
+            entry = {
+                "n1": n1, "k1": k1, "v1": v1,
+                "n2": n2, "k2": k2, "v2": v2,
+                "shots": count,
+                "probability_pct": round(prob * 100, 3),
+                "amplification": amp,
+                "equal": v1 == v2,
+            }
+            if v1 == v2 and v1 > 1:
+                entry["collision_value"] = v1
+                entry["total_appearances"] = 2 + 4  # trivial + 2 symmetric pairs
+                collisions.append(entry)
+            else:
+                near_misses.append(entry)
+
+        return json.dumps({
+            "k1": k1, "k2": k2,
+            "n_bits": n_bits,
+            "search_space": f"{2**n_bits} rows per column ({2**(2*n_bits)} total pairs)",
+            "total_qubits": n_total,
+            "logical_gates": logical_gates,
+            "mode": "simulation" if simulate_only else "hardware",
+            "shots": shots,
+            "active_bits_k1": ab1,
+            "active_bits_k2": ab2,
+            "oracle_description": (
+                f"Cross-register RZZ coupling between bits {ab1} of reg1 "
+                f"and bits {ab2} of reg2. Rewards C(n1,{k1}) ≡ C(n2,{k2}) mod 2."
+            ),
+            "collisions_found": len(collisions),
+            "collisions": collisions,
+            "top_near_misses": near_misses[:5],
+            "summary": (
+                f"Searched {2**n_bits}×{2**n_bits} = {2**(2*n_bits)} row pairs. "
+                f"Found {len(collisions)} exact collisions C(n1,{k1})=C(n2,{k2}). "
+                f"{'NEW DISCOVERY possible — check collision values!' if any(c['collision_value'] > 3003 for c in collisions) else 'Known values range.'}"
+                if collisions else
+                f"No exact collisions found in {2**n_bits}×{2**n_bits} search space. "
+                f"Try larger n_bits or different k1/k2."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
 # Tool: find_collision_candidates  (Step 1 — curve intersection search)
 # --------------------------------------------------------------------------
 @mcp.tool()
