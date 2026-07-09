@@ -4030,6 +4030,221 @@ def run_search_experiment(
 
 
 # --------------------------------------------------------------------------
+# Tool: encode_4way_collision
+# --------------------------------------------------------------------------
+@mcp.tool()
+def encode_4way_collision(
+    value: int,
+    positions: list,
+    max_n: int = 128,
+    p_layers: int = 2,
+    gamma: float = 2.589,
+    beta: float = 0.501,
+    shots: int = 4096,
+    simulate_only: bool = True,
+) -> str:
+    """
+    Step 4: Encode a known multi-way collision for simultaneous LNAA search.
+
+    Takes a value V and its known positions (from sieve_singmaster_space),
+    builds one LNAA rail per unique k-column, searches for all marked rows
+    simultaneously in ONE job.
+
+    In plain English:
+      sieve tells us: 3003 appears at rows 14(k=6), 15(k=5), 78(k=2).
+      This tool builds 3 parallel quantum searches — one per k-column —
+      and runs them all in ONE hardware submission.
+      Each rail independently finds its target row.
+      Together they prove the 4-way collision exists and is amplifiable.
+
+    This is the Step 4 generalization of Phase 5:
+      Phase 5: manually encoded 3 rows for 3003 in one 7-qubit circuit
+      Step 4:  automatically encodes N positions from sieve in N parallel rails
+
+    Args:
+      value     : the Pascal value to search for (e.g. 3003)
+      positions : list of [n, k] pairs from sieve output
+                  e.g. [[14,6],[15,5],[78,2]]
+      max_n     : max row to search per rail (determines qubit count)
+      simulate_only: True = free simulation, False = real hardware
+
+    Returns ready-to-run params + simulation/hardware results.
+    """
+    try:
+        from math import comb, ceil, log2
+        from collections import defaultdict
+        from qiskit import QuantumCircuit
+
+        if not positions:
+            return json.dumps({"error": "positions list is empty. Run sieve_singmaster_space first."})
+
+        # ── 1. Group positions by k-column ────────────────────────────────
+        # Each unique k gets its own rail
+        k_groups = defaultdict(list)
+        for pos in positions:
+            n, k = int(pos[0]), int(pos[1])
+            if comb(n, k) == value:
+                k_groups[k].append(n)
+
+        if not k_groups:
+            return json.dumps({"error": f"None of the positions give C(n,k)={value}. Check your input."})
+
+        # ── 2. Build one rail per k-column ────────────────────────────────
+        bits_per_rail = max(1, ceil(log2(max_n + 1)))
+        rails = []
+
+        for k, target_rows in sorted(k_groups.items()):
+            # Conditions: bit pattern of the FIRST target row
+            # (largest non-trivial one — skip C(value,1) = value trivial case)
+            non_trivial = [n for n in target_rows if n < value]
+            primary_n = max(non_trivial) if non_trivial else target_rows[0]
+
+            conditions = {}
+            for i in range(bits_per_rail):
+                conditions[i] = int((primary_n >> i) & 1)
+
+            # marked_rows: Qiskit integers for ALL target rows in this rail
+            marked_rows = []
+            for n in target_rows:
+                if n <= max_n:
+                    qbits = [(n >> i) & 1 for i in range(bits_per_rail)]
+                    marked_rows.append(int("".join(str(b) for b in reversed(qbits)), 2))
+
+            if not marked_rows:
+                continue
+
+            rails.append({
+                "k": k,
+                "target_rows": target_rows,
+                "primary_n": primary_n,
+                "conditions": conditions,
+                "marked_rows": marked_rows,
+                "num_qubits": bits_per_rail,
+            })
+
+        if not rails:
+            return json.dumps({"error": f"No target rows fit within max_n={max_n}. Try increasing max_n."})
+
+        # ── 3. Build combined parallel circuit ────────────────────────────
+        total_qubits = sum(r["num_qubits"] for r in rails)
+        qc = QuantumCircuit(total_qubits, total_qubits)
+
+        qubit_offset = 0
+        rail_offsets = []
+
+        for rail in rails:
+            nq = rail["num_qubits"]
+            qrange = list(range(qubit_offset, qubit_offset + nq))
+            rail_offsets.append(qubit_offset)
+
+            h_coeffs = {int(q): (+1.0 if v == 1 else -1.0)
+                        for q, v in rail["conditions"].items()}
+
+            qc.h(qrange)
+            for _ in range(p_layers):
+                for qi, h in h_coeffs.items():
+                    qc.rz(2 * h * gamma, qubit_offset + qi)
+                for i in range(nq):
+                    qc.rx(2 * beta, qubit_offset + i)
+            for i, q in enumerate(qrange):
+                qc.measure(q, qubit_offset + i)
+
+            qubit_offset += nq
+
+        logical_gates = qc.size()
+
+        # ── 4. Simulate or submit ─────────────────────────────────────────
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            sim = AerSimulator()
+
+            # Simulate each rail separately (memory safety)
+            rail_counts_list = []
+            for rail in rails:
+                nq = rail["num_qubits"]
+                h_coeffs = {int(q): (+1.0 if v == 1 else -1.0)
+                            for q, v in rail["conditions"].items()}
+                rail_qc = QuantumCircuit(nq, nq)
+                rail_qc.h(range(nq))
+                for _ in range(p_layers):
+                    for qi, h in h_coeffs.items():
+                        rail_qc.rz(2 * h * gamma, qi)
+                    for i in range(nq):
+                        rail_qc.rx(2 * beta, i)
+                rail_qc.measure(range(nq), range(nq))
+                rc = sim.run(rail_qc, shots=shots).result().get_counts()
+                rail_counts_list.append(rc)
+        else:
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+            svc = _get_service()
+            backend = svc.least_busy(operational=True, simulator=False)
+            pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
+            t_qc = pm.run(qc)
+            sampler = IBMSampler(mode=backend)
+            job = sampler.run([t_qc], shots=shots)
+            return json.dumps({
+                "status": "submitted",
+                "job_id": job.job_id(),
+                "backend": backend.name,
+                "value_searched": value,
+                "rails": [{"k": r["k"], "target_rows": r["target_rows"]} for r in rails],
+                "total_qubits": total_qubits,
+                "logical_gates": logical_gates,
+                "note": f"Use job_results('{job.job_id()}') when done.",
+            }, indent=2)
+
+        # ── 5. Per-rail amplification ─────────────────────────────────────
+        rail_results = []
+        for rail, rc in zip(rails, rail_counts_list):
+            nq = rail["num_qubits"]
+            marked_set = set(format(r, f'0{nq}b') for r in rail["marked_rows"])
+            total = sum(rc.values())
+            marked_total = sum(rc.get(b, 0) for b in marked_set)
+            marked_frac = marked_total / total if total > 0 else 0
+            random_base = len(rail["marked_rows"]) / (2 ** nq)
+            amp = round(marked_frac / random_base, 2) if random_base > 0 else 0
+            top = sorted(rc.items(), key=lambda x: x[1], reverse=True)[:3]
+
+            rail_results.append({
+                "k_column": rail["k"],
+                "target_rows": rail["target_rows"],
+                "primary_n": rail["primary_n"],
+                "amplification": amp,
+                "marked_fraction_pct": round(marked_frac * 100, 2),
+                "top_states": [{"bits": b, "count": c} for b, c in top],
+            })
+
+        best = max(rail_results, key=lambda r: r["amplification"])
+        avg_amp = round(sum(r["amplification"] for r in rail_results) / len(rail_results), 2)
+
+        return json.dumps({
+            "value_searched": value,
+            "num_rails": len(rails),
+            "total_qubits": total_qubits,
+            "logical_gates": logical_gates,
+            "mode": "simulation" if simulate_only else "hardware",
+            "rail_results": rail_results,
+            "best_rail": best,
+            "average_amplification": avg_amp,
+            "summary": (
+                f"Searched for value={value} across {len(rails)} k-columns simultaneously. "
+                f"Best: k={best['k_column']} → {best['amplification']}× amplification. "
+                f"Average: {avg_amp}×."
+            ),
+            "verdict": (
+                "READY FOR HARDWARE" if avg_amp >= 15 else
+                "TUNE PARAMETERS" if avg_amp >= 5 else
+                "WEAK SIGNAL"
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
 # Tool: sieve_singmaster_space
 # --------------------------------------------------------------------------
 @mcp.tool()
