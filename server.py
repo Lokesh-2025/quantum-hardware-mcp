@@ -4245,6 +4245,159 @@ def encode_4way_collision(
 
 
 # --------------------------------------------------------------------------
+# Tool: find_collision_candidates  (Step 1 — curve intersection search)
+# --------------------------------------------------------------------------
+@mcp.tool()
+def find_collision_candidates(
+    columns: list = [5, 6, 7, 8],
+    search_depth: int = 100000,
+    min_columns: int = 3,
+) -> str:
+    """
+    Step 1: Curve-intersection classical search for Singmaster candidates.
+
+    Instead of scanning every row (brute-force sieve), anchors on the
+    smallest target column and uses integer root-finding to jump directly
+    to candidate rows in other columns. No scanning needed.
+
+    In plain English:
+      Old way: check row 1, row 2, row 3 ... row 50000 — one by one.
+      New way: for each n in anchor column, compute N=C(n,k). Then solve
+               "what n gives C(n,k2)=N?" using algebra — jump straight there.
+      Like sudoku: use the rules to skip impossible positions entirely.
+
+    Applies three Einstein constraints automatically:
+      1. Solved pair elimination — (2,3),(2,4),(2,5),(2,6),(3,4) etc. are
+         fully solved in math literature. Flags if your combo is all-solved.
+      2. 2022 theorem — 9+ candidates only exist at small k. Warns if k>15.
+      3. Integer root-finding — k=2 uses exact closed form; k>=3 uses
+         Newton's method from (N*k!)^(1/k) estimate.
+
+    Args:
+      columns     : k-column values to search simultaneously
+                    e.g. [5,6,7,8] or [2,7,9] — avoid all-solved combos
+      search_depth: rows to scan in the anchor (smallest) column
+      min_columns : columns that must match for a candidate to be reported
+
+    Each candidate with 3 non-trivial columns = 8 total appearances (=3003).
+    Needs 4 non-trivial columns = 10 total = new world record.
+    """
+    try:
+        from math import comb, isqrt, factorial
+
+        # Solved column pairs — no new integer solutions beyond known ones
+        SOLVED_PAIRS = {
+            (2, 3), (2, 4), (2, 5), (2, 6), (2, 8),
+            (3, 4), (3, 6), (4, 6), (4, 8),
+        }
+
+        columns = sorted(set(int(c) for c in columns if int(c) >= 2))
+        if len(columns) < 2:
+            return json.dumps({"error": "Need at least 2 columns (k >= 2)."})
+
+        deep_cols = [k for k in columns if k > 15]
+        pairs = [(columns[i], columns[j])
+                 for i in range(len(columns))
+                 for j in range(i + 1, len(columns))]
+        solved_pairs_hit = [p for p in pairs
+                            if p in SOLVED_PAIRS or (p[1], p[0]) in SOLVED_PAIRS]
+        all_solved = len(solved_pairs_hit) == len(pairs)
+
+        k_anchor = columns[0]
+        other_cols = columns[1:]
+
+        def find_n_for_value(N, k):
+            """Return n such that C(n,k)=N using root-finding, or None."""
+            if k == 1:
+                return N if N >= 1 else None
+            if k == 2:
+                disc = 1 + 8 * N
+                s = isqrt(disc)
+                if s * s != disc:
+                    return None
+                n = (1 + s) // 2
+                return n if n >= 2 and comb(n, 2) == N else None
+            if k == 3:
+                est = int((6 * N) ** (1 / 3))
+                for n in range(max(3, est - 2), est + 5):
+                    v = comb(n, 3)
+                    if v == N:
+                        return n
+                    if v > N:
+                        break
+                return None
+            fk = factorial(k)
+            try:
+                est = int(round((N * fk) ** (1.0 / k)))
+            except OverflowError:
+                import math
+                est = int(math.exp((math.log(N) + math.log(fk)) / k))
+            for n in range(max(k, est - 3), est + 6):
+                v = comb(n, k)
+                if v == N:
+                    return n
+                if v > N:
+                    break
+            return None
+
+        candidates = []
+        for n1 in range(k_anchor, search_depth + 1):
+            N = comb(n1, k_anchor)
+            if N < 6:
+                continue
+            found = [(k_anchor, n1)]
+            for k in other_cols:
+                n2 = find_n_for_value(N, k)
+                if n2 is not None:
+                    found.append((k, n2))
+            if len(found) >= min_columns:
+                total = 2 + 2 * len(found)
+                candidates.append({
+                    "value": N,
+                    "non_trivial_columns": len(found),
+                    "total_appearances": total,
+                    "positions": [
+                        {"k": k, "n": n, "verify": f"C({n},{k})={comb(n,k)}"}
+                        for k, n in found
+                    ],
+                    "beats_world_record": total > 8,
+                })
+
+        candidates.sort(key=lambda x: -x["total_appearances"])
+        new_records = [c for c in candidates if c["beats_world_record"]]
+
+        return json.dumps({
+            "columns_searched": columns,
+            "anchor_column": k_anchor,
+            "search_depth": search_depth,
+            "rows_scanned_in_anchor": search_depth - k_anchor + 1,
+            "candidates_found": len(candidates),
+            "new_records_found": len(new_records),
+            "solved_pairs_in_combo": [list(p) for p in solved_pairs_hit],
+            "all_pairs_solved": all_solved,
+            "warning_all_solved": (
+                "All column pairs are solved — results will only repeat known values. "
+                "Try unsolved combos e.g. [5,6,7,8] or [2,7,9,11]."
+            ) if all_solved else None,
+            "warning_deep_interior": (
+                f"Columns {deep_cols} violate 2022 theorem — 9+ cannot exist there. "
+                "Stick to k <= 15."
+            ) if deep_cols else None,
+            "new_records": new_records,
+            "top_candidates": candidates[:20],
+            "summary": (
+                f"Scanned {search_depth - k_anchor + 1} rows in anchor column k={k_anchor}. "
+                f"Found {len(candidates)} values in {min_columns}+ columns simultaneously. "
+                f"New world records (>8 appearances): {len(new_records)}."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
 # Tool: sieve_singmaster_space
 # --------------------------------------------------------------------------
 @mcp.tool()
