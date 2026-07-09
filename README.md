@@ -178,6 +178,15 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 | `run_vqe` | Variational Quantum Eigensolver — H2 ground state to chemical accuracy |
 | `estimate_expectation` | Estimator primitive: computes ⟨ψ\|O\|ψ⟩ for Pauli observables |
 
+### Discovery tools (Singmaster pipeline)
+
+| Tool | What it does |
+|------|-------------|
+| `sieve_singmaster_space` | Classical Lucas theorem sieve — filters 98%+ of Pascal's Triangle search space before touching the QPU |
+| `find_collision_candidates` | Curve intersection search — integer root-finding across column pairs to jump directly to candidate rows |
+| `encode_4way_collision` | Takes a value + sieve positions, builds one LNAA rail per k-column, searches all simultaneously in one hardware job |
+| `equality_oracle_search` | Two-register LNAA — discovers C(n1,k1)=C(n2,k2) collisions **without being given the answer first**. Cross-register RZZ encodes Lucas mod-2 equality. Found C(16,2)=C(10,3)=120 blind. |
+
 ### Observability
 
 | Tool | What it does |
@@ -395,7 +404,7 @@ Restart Claude Desktop. All 34 tools appear under the hammer icon.
 - [x] Singmaster Step 4 — **178.8× amplification, 24 qubits, ibm_fez** (hardware record)
 
 **Next**
-- [ ] Elliptic curve solver — find N satisfying C(a,2)=C(b,3)=C(c,4)=C(d,5) simultaneously (SageMath integration)
+- [ ] Web interface — visual frontend for device comparison, job submission, circuit playground, live results (in progress: quantum-hardware-web)
 - [ ] `inject_topological_walk` — bypass transpiler using calibration DB, map directly to high-coherence qubits
 - [ ] `discover_energy_landscape` — LNAA parameter sweep → full energy landscape visualization
 - [ ] `algorithm_selector` — decides Grover vs LNAA based on circuit + hardware analysis
