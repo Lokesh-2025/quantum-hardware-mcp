@@ -4165,12 +4165,44 @@ def run_parallel_collision_search(
 
         # ── 3. Simulate or submit ─────────────────────────────────────────
         if simulate_only:
-            # Run directly on AerSimulator — skip pass manager to avoid
-            # HighLevelSynthesis choking on measurement gates in multi-rail circuits
+            # Simulate each rail separately to avoid memory explosion.
+            # 27-qubit statevector needs 16GB; 9-qubit needs 512MB.
+            # Hardware submission still uses the combined circuit.
             from qiskit_aer import AerSimulator
+            from qiskit import QuantumCircuit as _QC
             sim = AerSimulator()
-            job = sim.run(qc, shots=shots)
-            counts = job.result().get_counts()
+
+            rail_counts_list = []
+            qubit_offset_sim = 0
+            for rail in active_rails:
+                nq = rail["num_qubits"]
+                h_coeffs_r = {int(q): (+1.0 if v == 1 else -1.0)
+                              for q, v in rail["conditions"].items()}
+                rail_qc = _QC(nq, nq)
+                rail_qc.h(range(nq))
+                for _ in range(p_layers):
+                    for qi, h in h_coeffs_r.items():
+                        rail_qc.rz(2 * h * gamma, qi)
+                    for i in range(nq):
+                        rail_qc.rx(2 * beta, i)
+                rail_qc.measure(range(nq), range(nq))
+                rail_counts = sim.run(rail_qc, shots=shots).result().get_counts()
+                rail_counts_list.append(rail_counts)
+                qubit_offset_sim += nq
+
+            # Build a fake combined counts dict so the rail-splitting code below works
+            # Each rail's bitstring is padded to fill its place in the combined register
+            counts = {}
+            total_q = sum(r["num_qubits"] for r in active_rails)
+            offset = 0
+            for rail, rc in zip(active_rails, rail_counts_list):
+                nq = rail["num_qubits"]
+                before = total_q - offset - nq   # high bits (other rails above)
+                after  = offset                  # low bits (other rails below)
+                for bits, cnt in rc.items():
+                    full = "0" * before + bits + "0" * after
+                    counts[full] = counts.get(full, 0) + cnt
+                offset += nq
         else:
             from qiskit_ibm_runtime import QiskitRuntimeService
             from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
