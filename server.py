@@ -4204,16 +4204,11 @@ def run_parallel_collision_search(
                     counts[full] = counts.get(full, 0) + cnt
                 offset += nq
         else:
-            from qiskit_ibm_runtime import QiskitRuntimeService
             from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
             from qiskit_ibm_runtime import SamplerV2 as IBMSampler
 
-            token = os.getenv("IBM_QUANTUM_TOKEN")
-            if not token:
-                return json.dumps({"error": "IBM_QUANTUM_TOKEN not set in .env"})
-
-            svc = QiskitRuntimeService(channel="ibm_quantum", token=token)
-            bname = backend_name or "ibm_marrakesh"
+            svc = _get_service()
+            bname = backend_name or "ibm_kingston"
             backend = svc.backend(bname)
             pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
             t_qc = pm.run(qc)
