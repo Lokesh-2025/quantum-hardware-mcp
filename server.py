@@ -4380,29 +4380,25 @@ def equality_oracle_search(
                 "note": f"Use job_results('{job.job_id()}') when done.",
             }, indent=2)
 
-        # ── 4. Post-process: find real collisions in top peaks ─────────────
+        # ── 4. Post-process: scan ALL counts for exact collisions ─────────
         total_shots = sum(counts.values())
-        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:30]
+        random_baseline = 1.0 / (4 ** n_bits)
 
         collisions = []
         near_misses = []
-        random_baseline = 1.0 / (4 ** n_bits)  # 1 / (2^n * 2^n)
 
-        for bitstring, count in top:
-            # Qiskit: MSB first. reg2 is leftmost n_bits, reg1 is rightmost.
+        # Scan every measured bitstring — collisions may not be in top N
+        for bitstring, count in counts.items():
             reg2_bits = bitstring[:n_bits]
             reg1_bits = bitstring[n_bits:]
             n1 = int(reg1_bits, 2)
             n2 = int(reg2_bits, 2)
-
             if n1 < k1 or n2 < k2:
                 continue
-
             v1 = comb(n1, k1)
             v2 = comb(n2, k2)
             prob = count / total_shots
             amp = round(prob / random_baseline, 1)
-
             entry = {
                 "n1": n1, "k1": k1, "v1": v1,
                 "n2": n2, "k2": k2, "v2": v2,
@@ -4413,10 +4409,28 @@ def equality_oracle_search(
             }
             if v1 == v2 and v1 > 1:
                 entry["collision_value"] = v1
-                entry["total_appearances"] = 2 + 4  # trivial + 2 symmetric pairs
+                entry["total_appearances"] = 2 + 4
                 collisions.append(entry)
-            else:
-                near_misses.append(entry)
+
+        # Top near-misses from the top-30 high-count states
+        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:30]
+        for bitstring, count in top:
+            reg2_bits = bitstring[:n_bits]
+            reg1_bits = bitstring[n_bits:]
+            n1 = int(reg1_bits, 2)
+            n2 = int(reg2_bits, 2)
+            if n1 < k1 or n2 < k2:
+                continue
+            v1 = comb(n1, k1)
+            v2 = comb(n2, k2)
+            if v1 != v2:
+                prob = count / total_shots
+                near_misses.append({
+                    "n1": n1, "k1": k1, "v1": v1,
+                    "n2": n2, "k2": k2, "v2": v2,
+                    "shots": count,
+                    "amplification": round(prob / random_baseline, 1),
+                })
 
         return json.dumps({
             "k1": k1, "k2": k2,
