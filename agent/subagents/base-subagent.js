@@ -153,8 +153,10 @@ ${modelCallLine}
             }
 
         } else {
-            finalAnswer = textResponse;
-            break;
+            // Unrecognised action — do NOT treat as a final answer.
+            // Feed an error back so the LLM corrects itself.
+            const badAction = action.action || JSON.stringify(action).substring(0, 80);
+            currentPrompt = `ERROR: "${badAction}" is not a valid action. You must respond with ONLY one of these JSON formats:\n- { "action": "tool", "toolName": "<name>", "toolArguments": {<args>} }\n${modelCallLine ? modelCallLine + '\n' : ''}- { "action": "answer", "finalAnswer": "<text>" }\n\nDo NOT write code. Call the appropriate tool directly.`;
         }
     }
 
