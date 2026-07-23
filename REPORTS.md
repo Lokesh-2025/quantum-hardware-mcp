@@ -314,3 +314,127 @@
 **Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
 
 ![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-09
+
+**Best machine today:** ibm_kingston (123 jobs in queue, avg CX error 0.0337)
+
+**Getting worse:** ibm_fez (CX error 0.0338 → 0.0440), ibm_kingston (CX error 0.0303 → 0.0337)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-10
+
+**Best machine today:** ibm_kingston (64 jobs in queue, avg CX error 0.0365)
+
+**Getting worse:** ibm_fez (CX error 0.0363 → 0.0442, queue +9076), ibm_kingston (CX error 0.0318 → 0.0365)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-11
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+**Getting worse:** ibm_fez (CX error 0.0443 → 0.0442, queue +4625)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-12
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+**Getting worse:** ibm_fez (CX error 0.0443 → 0.0442, queue +4625)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-13
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+**Getting worse:** ibm_fez (CX error 0.0443 → 0.0442, queue +2310)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-14
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+**Getting worse:** ibm_fez (CX error 0.0442 → 0.0442, queue +4606)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-15
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+**Getting worse:** ibm_fez (CX error 0.0440 → 0.0442, queue +4627)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-16
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+**Getting worse:** ibm_fez (CX error 0.0440 → 0.0442, queue +4627)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-17
+
+**Best machine today:** ibm_marrakesh (0 jobs in queue)
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-22
+
+**Best machine today:** ibm_kingston (277 jobs in queue, avg CX error 0.0337)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_fez, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
+
+---
+
+## Quantum Weatherman — 2026-07-23
+
+**Best machine today:** ibm_kingston (277 jobs in queue, avg CX error 0.0337)
+
+**Steady:** Aquila, Aria 1, Aria 2, Borealis, Forte 1, Forte Enterprise 1, Harmony, SV1, TN1, dm1, ibm_fez, ibm_kingston, ibm_marrakesh, qpu.aria-1, qpu.aria-2, qpu.forte-1, qpu.forte-enterprise-1, qpu.harmony, simulator
+
+![Trend chart](chart.png)
