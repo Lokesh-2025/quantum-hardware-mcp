@@ -4,8 +4,6 @@ A production MCP server that gives AI assistants programmatic access to live qua
 
 Built in collaboration with [Jack Woehr](https://github.com/jwoehr) — IBM Quantum veteran, Qiskit contributor.
 
-Listed on [Glama](https://glama.ai), [mcp.so](https://mcp.so), and [PulseMCP](https://pulsemcp.com).
-
 ---
 
 ## Why this exists
@@ -34,14 +32,14 @@ The root cause was not the transpiler. It was **graph embedding**: one ancilla q
 
 This is now baked into the server as `check_routing_overhead` — it detects degree-4 violations before you submit.
 
-**The LNAA breakthrough (Phase 5):**
-After discovering that Grover's oracle structure creates an unfixable degree-4 node on heavy-hex, we scrapped Grover entirely. We derived an Ising Hamiltonian from scratch where the target rows (14, 15, 78) are the ground states of a magnetic system. IBM's RZZ and RX gates implement this natively — no routing, no SWAP, no ancilla.
+**The LNAA approach (Phase 5):**
+After discovering that Grover's oracle structure creates an unfixable degree-4 node on heavy-hex, we scrapped Grover entirely. Instead of a Boolean oracle, we built an Ising Hamiltonian — the same encoding family behind QAOA and quantum annealing — where target rows (14, 15, 78, found classically via the Lucas-theorem sieve beforehand) are the ground states. IBM's RZZ and RX gates implement this natively — no routing, no SWAP, no ancilla.
 
-Result: **27.78× amplification with 135 hardware gates** on ibm_marrakesh.
+Result: **27.78× amplitude amplification, preparing and confirming those already-known target states, with 135 hardware gates** on ibm_marrakesh.
 
 Previous best: 4.17× with 103 gates (Phase 3, Grover).
 
-This is the first time Lattice-Native Amplitude Amplification has been applied to Singmaster's Conjecture on real quantum hardware. The insight — encode targets as ground states, not Boolean conditions — is now the `encode_search_problem` tool.
+Important honesty note: the sieve (classical, microseconds) finds *which* rows collide. The quantum circuit doesn't discover that fact — it demonstrates that a hardware-native encoding can prepare and amplify those known target states without routing overhead, at scale, in one job. That's a real result about circuit design and hardware efficiency, not a mathematical discovery. We call the technique LNAA (Lattice-Native Amplitude Amplification) as a name for this specific application of Ising-Hamiltonian encoding to Pascal's Triangle collision search — the underlying math (Ising embeddings, native-gate execution) is well-established, not new. The insight worth keeping — encode targets as ground states, not Boolean conditions, so the circuit matches the hardware's native connectivity — is now the `encode_search_problem` tool.
 
 ---
 
@@ -52,7 +50,7 @@ This is the first time Lattice-Native Amplitude Amplification has been applied t
 | Provider | Backends | Access |
 |----------|----------|--------|
 | IBM Quantum | 3 QPUs (ibm_torino 133q, ibm_marrakesh 156q, ibm_fez 156q) | API token |
-| IonQ | 6 (Aria, Forte, Harmony + simulators) | API key |
+| IonQ | 6 registered (Harmony + both Aria retired; both Forte currently unavailable pending access; simulator active) | API key |
 | AWS Braket | 10 (QuEra Aquila 256q, IonQ via Braket, Rigetti via Braket, simulators) | IAM credentials |
 
 All 19 are polled every 2 hours. The dataset grows continuously — ML routing recommendations are planned once 60+ days of data accumulate.
@@ -128,7 +126,7 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 
 ---
 
-## Tools (34 total)
+## Tools (39 total)
 
 ### Device intelligence
 
@@ -185,7 +183,7 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 | `sieve_singmaster_space` | Classical Lucas theorem sieve — filters 98%+ of Pascal's Triangle search space before touching the QPU |
 | `find_collision_candidates` | Curve intersection search — integer root-finding across column pairs to jump directly to candidate rows |
 | `encode_4way_collision` | Takes a value + sieve positions, builds one LNAA rail per k-column, searches all simultaneously in one hardware job |
-| `equality_oracle_search` | Two-register LNAA — discovers C(n1,k1)=C(n2,k2) collisions **without being given the answer first**. Cross-register RZZ encodes Lucas mod-2 equality. Found C(16,2)=C(10,3)=120 blind. |
+| `equality_oracle_search` | Two-register LNAA — amplifies (n1, n2) pairs matching a Lucas mod-2 parity oracle (cross-register RZZ), without being told which rows to look for. Parity match is a weak, ~50%-hit-rate filter, not proof of equality — classical post-processing (`comb()`) checks every measured pair for true equality. Confirmed C(16,2)=C(10,3)=120 this way. |
 
 ### Observability
 
@@ -216,12 +214,12 @@ Singmaster's Conjecture asks whether any integer appears 9+ times in Pascal's Tr
 | Phase 1 | Grover, 4 qubits, target=6 | 611 | **4.11×** | ibm_kingston | Signal clear |
 | Phase 2 | Grover, 4 qubits, unoptimized | 16,271 | **1.04×** | ibm_marrakesh | Noise floor — 161× transpilation overhead |
 | Phase 3 v3 | Grover, 4 qubits, opt=2 seed=42 | 103 | **4.17×** | ibm_marrakesh | 99.4% gate reduction |
-| Phase 4 v1 | Grover, 7 qubits, rows 14+15+78 | 624 | **3.04×** | ibm_marrakesh | Row 78 found for first time |
+| Phase 4 v1 | Grover, 7 qubits, rows 14+15+78 | 624 | **3.04×** | ibm_marrakesh | Row 78 (known from sieve) confirmed prepared on hardware |
 | Phase 4 v2 | Grover, 7 qubits, lossy oracle | 1,037 | **1.92×** | ibm_marrakesh | Routing failure — degree-4 node |
-| Phase 5 | LNAA, 7 qubits, Ising walk | **135** | **27.78×** | ibm_marrakesh | Hardware record at time |
+| Phase 5 | LNAA, 7 qubits, Ising walk | **135** | **27.78×** | ibm_marrakesh | Best amplification in this project's series at the time |
 | Phase 6 | LNAA auto-collision, 9 qubits | 45 | **122.92×** | simulation | Zero manual design |
-| Step 3 | 3 parallel rails, 30 qubits | 180 | **~300×** | ibm_kingston | New hardware record |
-| Step 4 | 4-way collision, 24 qubits | 144 | **178.8×** | ibm_fez | **First hardware-confirmed 4-way Pascal collision** |
+| Step 3 | 3 parallel rails, 30 qubits | 180 | **~300×** | ibm_kingston | Best in-project result so far |
+| Step 4 | 4-way collision, 24 qubits | 144 | **178.8×** | ibm_fez | 4 known (classically pre-computed) target rows prepared and confirmed simultaneously on hardware |
 
 **Step 4 detail (ibm_fez, job d97fk8t2su3c739i26fg, 4096 shots):**
 
@@ -237,7 +235,7 @@ Per-rail amplification: 178.8×   (sim predicted 190.27× — 94% retention)
 2nd-best state: 2.17% — target is 25× cleaner than noise
 ```
 
-**Classical sieve:** `sieve_singmaster_space` searched n=2..50,000 × k=2..200 (~5M values). No 9+ appearances found. 3003 is the sole 8-way champion. Consistent with Singmaster's Conjecture.
+**Classical sieve:** `sieve_singmaster_space` searched n=2..50,000 × k=2..200 (~5M values), entirely classically, in seconds. No 9+ appearances found. 3003 is the sole 8-way champion in this range. This doesn't push the boundary of what's known about Singmaster's Conjecture — published classical searches have already gone far beyond this bound. The sieve's role here is to supply known target values for the hardware experiments above, not to contribute new number-theoretic results.
 
 **The complete pipeline:**
 ```

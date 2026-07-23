@@ -47,6 +47,7 @@ import math
 import sqlite3
 import argparse
 import anyio
+import requests
 import contextvars
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -2163,18 +2164,27 @@ def ionq_devices() -> str:
         })
 
     try:
-        from qiskit_ionq import IonQProvider
-        provider = IonQProvider(api_key)
-        backends = provider.backends()
+        # Direct REST API — the qiskit_ionq SDK's IonQProvider.backends() only
+        # surfaces 2 of 6 real backends (stale/legacy endpoint). This is the
+        # same endpoint snapshot.py uses and it returns the full fleet.
+        resp = requests.get(
+            "https://api.ionq.co/v0.3/backends",
+            headers={"Authorization": f"apiKey {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        backends = resp.json()
 
         result = []
         for b in backends:
-            available = b.status()
+            name = b.get("backend", b.get("name", "unknown"))
+            status = b.get("status")
             result.append({
-                "name": b.name,
-                "num_qubits": b.num_qubits,
-                "available": bool(available),
-                "type": "simulator" if "simulator" in b.name else "hardware",
+                "name": name,
+                "num_qubits": b.get("qubits"),
+                "available": status == "available",
+                "status": status,  # "available" | "unavailable" | "retired"
+                "type": "simulator" if "simulator" in name else "hardware",
                 "provider": "IonQ",
                 "technology": "trapped-ion",
             })
@@ -4245,7 +4255,8 @@ def encode_4way_collision(
 
 
 # --------------------------------------------------------------------------
-# Tool: equality_oracle_search  (Discovery engine — no answer needed)
+# Tool: equality_oracle_search  (parity-oracle amplification + classical
+# equality verification — the QPU narrows candidates, comb() confirms them)
 # --------------------------------------------------------------------------
 @mcp.tool()
 def equality_oracle_search(
@@ -4260,21 +4271,30 @@ def equality_oracle_search(
     backend_name: str = "",
 ) -> str:
     """
-    Discovery engine: find C(n1,k1) = C(n2,k2) WITHOUT knowing the answer first.
+    Find C(n1,k1) = C(n2,k2) without being told which rows to look for.
 
-    This is the fundamental upgrade from verification to discovery.
+    Honest framing: the quantum circuit amplifies toward a Lucas mod-2
+    PARITY match, which is a weak filter (roughly half of random pairs
+    satisfy it by chance) — it is not proof of equality. The actual
+    equality check is classical: every measured bitstring is verified
+    with exact comb() arithmetic in post-processing. The QPU's real job
+    here is candidate narrowing via amplification, not final verification.
 
-    OLD WAY (encode_4way_collision):
-      Input the answer (e.g. 3003 at rows 14,15,78) → circuit confirms it loudly.
-      Needs the answer before it can run. Not a search.
+    Difference from encode_4way_collision:
 
-    NEW WAY (this tool):
-      Input only the two columns k1, k2.
+    encode_4way_collision:
+      Input the answer (e.g. 3003 at rows 14,15,78) → circuit prepares and
+      confirms that known state. Needs the answer before it can run.
+
+    This tool:
+      Input only the two columns k1, k2 — not the answer.
       Two qubit registers in superposition — one per column.
       Cross-register RZZ gates encode the Lucas mod-2 equality oracle:
         "mark any (n1, n2) where C(n1,k1) and C(n2,k2) have the same parity."
-      LNAA amplifies matching pairs. Measurement discovers which rows collide.
-      No answer needed. The QPU finds it.
+      LNAA amplifies pairs matching that parity condition — a real but
+      weak filter (~50% of random pairs pass it by chance). The QPU
+      narrows the candidate set; classical comb() in post-processing
+      determines which amplified candidates are true equalities.
 
     Lucas mod-2 oracle (why it's cheap):
       By Lucas' theorem, C(n,k) mod 2 = 1 iff every 1-bit of k is also a 1-bit of n.
