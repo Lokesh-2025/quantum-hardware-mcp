@@ -478,8 +478,19 @@ def collect_ibm() -> list[dict]:
         print("  [IBM] IBM_QUANTUM_TOKEN not set — skipping", file=sys.stderr)
         return []
 
-    service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
-    backends = service.backends()
+    try:
+        service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
+        backends = service.backends()
+    except Exception as e:
+        if "No matching instances" in str(e) or "not a valid instance" in str(e):
+            # IBM changed instance resolution — save account first then reload
+            QiskitRuntimeService.save_account(
+                channel="ibm_quantum_platform", token=token, overwrite=True
+            )
+            service = QiskitRuntimeService(channel="ibm_quantum_platform")
+            backends = service.backends()
+        else:
+            raise
     rows = []
     for backend in backends:
         status = backend.status()
