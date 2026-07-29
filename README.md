@@ -207,44 +207,11 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 
 ## Real experiments: Singmaster's Conjecture on IBM hardware
 
-Singmaster's Conjecture asks whether any integer appears 9+ times in Pascal's Triangle. We use this server as active research infrastructure — not a demo. All job IDs are real. All results are reproducible.
-
-| Phase | Approach | Gates | Amplification | Backend | Finding |
-|-------|----------|-------|---------------|---------|---------|
-| Phase 1 | Grover, 4 qubits, target=6 | 611 | **4.11×** | ibm_kingston | Signal clear |
-| Phase 2 | Grover, 4 qubits, unoptimized | 16,271 | **1.04×** | ibm_marrakesh | Noise floor — 161× transpilation overhead |
-| Phase 3 v3 | Grover, 4 qubits, opt=2 seed=42 | 103 | **4.17×** | ibm_marrakesh | 99.4% gate reduction |
-| Phase 4 v1 | Grover, 7 qubits, rows 14+15+78 | 624 | **3.04×** | ibm_marrakesh | Row 78 (known from sieve) confirmed prepared on hardware |
-| Phase 4 v2 | Grover, 7 qubits, lossy oracle | 1,037 | **1.92×** | ibm_marrakesh | Routing failure — degree-4 node |
-| Phase 5 | LNAA, 7 qubits, Ising walk | **135** | **27.78×** | ibm_marrakesh | Best amplification in this project's series at the time |
-| Phase 6 | LNAA auto-collision, 9 qubits | 45 | **122.92×** | simulation | Zero manual design |
-| Step 3 | 3 parallel rails, 30 qubits | 180 | **~300×** | ibm_kingston | Best in-project result so far |
-| Step 4 | 4-way collision, 24 qubits | 144 | **178.8×** | ibm_fez | 4 known (classically pre-computed) target rows prepared and confirmed simultaneously on hardware |
-
-**Step 4 detail (ibm_fez, job d97fk8t2su3c739i26fg, 4096 shots):**
-
-```
-Dominant bitstring: 000011100000111101001110  →  1,396 shots (34.08%)
-
-Decoded rail by rail:
-  Rail k=6  bits 00001110  →  row 14   C(14,6) = 3003  ✓
-  Rail k=5  bits 00001111  →  row 15   C(15,5) = 3003  ✓
-  Rail k=2  bits 01001110  →  row 78   C(78,2) = 3003  ✓
-
-Per-rail amplification: 178.8×   (sim predicted 190.27× — 94% retention)
-2nd-best state: 2.17% — target is 25× cleaner than noise
-```
-
-**Classical sieve:** `sieve_singmaster_space` searched n=2..50,000 × k=2..200 (~5M values), entirely classically, in seconds. No 9+ appearances found. 3003 is the sole 8-way champion in this range. This doesn't push the boundary of what's known about Singmaster's Conjecture — published classical searches have already gone far beyond this bound. The sieve's role here is to supply known target values for the hardware experiments above, not to contribute new number-theoretic results.
-
-**The complete pipeline:**
-```
-sieve_singmaster_space → encode_4way_collision → IBM QPU → get_amplification
-```
+These tools were validated end-to-end using Singmaster's Conjecture (does any integer appear 9+ times in Pascal's Triangle?) as a real hardware case study — not a demo. `encode_4way_collision` achieved **178.8× amplitude amplification** on real IBM hardware (ibm_fez, job `d97fk8t2su3c739i26fg`), simultaneously confirming 4 classically-known target rows in one job — up from 4.17× in the project's earlier Grover-based approach. All job IDs are real and reproducible.
 
 **Key insight:** IBM heavy-hex is an Ising lattice. RZZ + RX gates are native — zero routing overhead. Encoding targets as ground states of a Hamiltonian outperforms Boolean oracle + diffusion when hardware topology constrains qubit degree ≤ 3.
 
-Full experiment history: [singmasters-conjecture](https://github.com/Lokesh-2025/singmasters-conjecture)
+Full experiment history, result tables, and IonQ cross-vendor work live in a private research repo — reach out if you'd like access.
 
 ---
 
