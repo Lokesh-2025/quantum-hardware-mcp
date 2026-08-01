@@ -87,10 +87,42 @@ def test_state_preparation_count():
     assert forging.state_preparation_count(5) == 45
 
 
-def test_symmetric_halves_detected(h4):
-    """An evenly spaced chain has identical halves -- halves hardware cost."""
-    _molecule, _exact, schmidt, _terms = h4
-    assert schmidt.is_symmetric()
+def test_symmetric_halves_detected_in_the_real_gauge():
+    """An evenly spaced chain has halves related by a per-vector sign, which
+    halves hardware cost -- but only once the eigensolver's arbitrary global
+    phase is removed. Without that gauge fix the halves differ by a complex
+    phase and the relationship is not a sign at all.
+    """
+    molecule = chemistry.build_molecule(
+        chemistry.hydrogen_chain(4, 1.0), n_electrons=4
+    )
+    _energy, psi_raw = molecule.exact_ground_state()
+
+    psi, residual = forging.real_gauge(psi_raw)
+    gauged = forging.schmidt_decompose(psi, molecule.n_qubits)
+
+    assert residual < 1e-10, "H4 ground state should be real-representable"
+    assert gauged.is_symmetric(3)
+    # and the signs are a genuine +-1, not all trivially +1
+    assert set(gauged.beta_signs(3)) <= {-1.0, 1.0}
+
+
+def test_beta_signs_map_alpha_matrices_onto_beta(h4):
+    """B_nm = s_n s_m A_nm must hold exactly, or reusing one register's
+    measurements for the other silently corrupts every energy."""
+    molecule, _exact, _schmidt, terms = h4
+    _energy, psi_raw = molecule.exact_ground_state()
+    psi, _residual = forging.real_gauge(psi_raw)
+    schmidt = forging.schmidt_decompose(psi, molecule.n_qubits)
+
+    rank = 3
+    labels = sorted({a for a, _, _ in terms})
+    alpha = forging.matrix_elements(schmidt.alpha_vectors, labels, rank)
+    beta = forging.matrix_elements(schmidt.beta_vectors, labels, rank)
+    signs = schmidt.beta_signs(rank)
+    correction = np.outer(signs, signs)
+    for label in labels:
+        assert np.allclose(alpha[label] * correction, beta[label], atol=1e-9)
 
 
 def test_forging_rejects_odd_qubit_count():

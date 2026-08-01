@@ -2045,6 +2045,265 @@ def estimate_circuit_error_ceiling(two_qubit_gates: int, one_qubit_gates: int = 
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def build_forged_circuits(atoms: str, n_electrons: int, schmidt_rank: int = 3,
+                          max_circuits: int = 60) -> str:
+    """
+    Build the actual runnable circuits for a forged ground-state calculation.
+
+    Turns a molecule into OpenQASM you can submit. Every circuit is a real
+    entanglement-forging circuit acting on HALF the qubits the molecule would
+    otherwise need.
+
+    Use this when you want to inspect or submit the circuits yourself. Use
+    run_forged_energy to build, submit and collect in one step.
+
+    Args:
+        atoms: geometry in Angstrom, e.g. "H 0 0 0; H 0 0 0.74"
+        n_electrons: total electrons
+        schmidt_rank: how many Schmidt terms to keep. Higher is more accurate
+            but costs circuits quadratically -- check analyze_molecule for the
+            accuracy floor at each rank.
+        max_circuits: refuse to build more than this many (guards against
+            accidentally generating hundreds of hardware jobs).
+
+    Returns JSON with the QASM strings, circuit count, gate statistics, and a
+    local simulator self-check confirming the circuits reconstruct the right
+    energy before you spend any hardware time.
+    """
+    try:
+        _chem, _diag, _forging, _grouping = _load_qforge()
+        from qforge import experiment as qforge_experiment
+
+        geometry = _parse_geometry(atoms)
+        built = qforge_experiment.build_experiment(
+            geometry, n_electrons, rank=schmidt_rank
+        )
+        if built.n_circuits > max_circuits:
+            return json.dumps({
+                "error": (
+                    f"{built.n_circuits} circuits exceeds max_circuits="
+                    f"{max_circuits}. Lower schmidt_rank or raise the limit "
+                    "deliberately."
+                ),
+                "circuits_required": built.n_circuits,
+                "schmidt_rank": built.rank,
+            })
+
+        passed, self_check_error = qforge_experiment.self_check(built)
+        two_qubit = [
+            sum(1 for inst in c.data if inst.operation.name == "cx")
+            for c in built.circuits
+        ]
+
+        return json.dumps({
+            "molecule": {
+                "geometry": atoms,
+                "exact_energy_hartree": round(float(built.exact_energy), 6),
+                "qubits_direct": built.molecule.n_qubits,
+                "qubits_per_circuit": built.molecule.n_qubits // 2,
+            },
+            "schmidt_rank": built.rank,
+            "accuracy_floor_kcal_mol": round(built.accuracy_floor_kcal_mol, 4),
+            "circuits": built.n_circuits,
+            "measurement_bases": len(built.groups),
+            "two_qubit_gates_per_circuit": {
+                "min": min(two_qubit),
+                "median": int(np.median(two_qubit)),
+                "max": max(two_qubit),
+            },
+            "self_check": {
+                "passed": bool(passed),
+                "simulator_error_kcal_mol": round(float(self_check_error), 4),
+                "note": (
+                    "The full pipeline was replayed on a local simulator and "
+                    "reconstructed the energy. A failure here means the "
+                    "circuits are wrong -- do not submit them."
+                ),
+            },
+            "qasm": [
+                qforge_experiment.to_qasm(c) for c in built.circuits
+            ],
+            "next_step": (
+                "Submit each QASM string with submit_job, keep the job_ids in "
+                "order, then pass them to collect_forged_energy. Or call "
+                "run_forged_energy to do all of it."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def run_forged_energy(atoms: str, n_electrons: int, device_name: str,
+                      schmidt_rank: int = 2, shots: int = 1024,
+                      max_circuits: int = 20) -> str:
+    """
+    Run a molecular ground-state calculation on real quantum hardware.
+
+    Builds the forged circuits, submits every one to the named device, and
+    returns the job IDs. Collect the energy afterwards with
+    collect_forged_energy once the jobs finish.
+
+    This submits REAL JOBS that consume queue time and, on paid hardware,
+    money. It refuses to run unless the circuits pass a local simulator
+    self-check first, and caps the number of jobs at max_circuits.
+
+    Args:
+        atoms: geometry in Angstrom, e.g. "H 0 0 0; H 0 0 0.74"
+        n_electrons: total electrons
+        device_name: target machine, e.g. "ibm_fez". Pick one with
+            compare_devices or queue_status.
+        schmidt_rank: Schmidt terms to keep. Rank 2 is exact for H2 and needs
+            only a handful of circuits -- a sensible first hardware run.
+        shots: shots per circuit (default 1024)
+        max_circuits: hard cap on submitted jobs (default 20). Raise it
+            deliberately, having checked the count with build_forged_circuits.
+
+    Returns JSON with the ordered job IDs and everything
+    collect_forged_energy needs.
+    """
+    try:
+        _chem, _diag, _forging, _grouping = _load_qforge()
+        from qforge import experiment as qforge_experiment
+
+        geometry = _parse_geometry(atoms)
+        built = qforge_experiment.build_experiment(
+            geometry, n_electrons, rank=schmidt_rank
+        )
+
+        if built.n_circuits > max_circuits:
+            return json.dumps({
+                "error": (
+                    f"would submit {built.n_circuits} separate jobs, above "
+                    f"max_circuits={max_circuits}. Each job queues separately, "
+                    "so start small: schmidt_rank=2 on H2 needs only a few."
+                ),
+                "circuits_required": built.n_circuits,
+                "suggestion": "lower schmidt_rank, or raise max_circuits deliberately",
+            })
+
+        # Never submit circuits that cannot reconstruct the right answer in
+        # simulation -- a wrong sign or frame would burn queue time for nothing.
+        passed, self_check_error = qforge_experiment.self_check(built)
+        if not passed:
+            return json.dumps({
+                "error": "circuits failed the local simulator self-check",
+                "simulator_error_kcal_mol": round(float(self_check_error), 4),
+                "note": "Not submitting. This indicates a bug, not device noise.",
+            })
+
+        job_ids = []
+        for position, circuit in enumerate(built.circuits):
+            qasm = qforge_experiment.to_qasm(circuit)
+            response = json.loads(submit_job(device_name, qasm, shots=shots))
+            if "error" in response:
+                return json.dumps({
+                    "error": f"submission failed at circuit {position}: "
+                             f"{response['error']}",
+                    "job_ids_submitted_so_far": job_ids,
+                    "note": "Earlier jobs are already queued; cancel them if unwanted.",
+                })
+            job_ids.append(response["job_id"])
+
+        return json.dumps({
+            "status": "submitted",
+            "device": device_name,
+            "geometry": atoms,
+            "n_electrons": n_electrons,
+            "schmidt_rank": built.rank,
+            "shots": shots,
+            "circuits_submitted": len(job_ids),
+            "job_ids": job_ids,
+            "exact_energy_hartree": round(float(built.exact_energy), 6),
+            "accuracy_floor_kcal_mol": round(built.accuracy_floor_kcal_mol, 4),
+            "self_check_error_kcal_mol": round(float(self_check_error), 4),
+            "next_step": (
+                "Wait for all jobs to reach DONE (job_status), then call "
+                "collect_forged_energy with these job_ids IN THIS ORDER."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def collect_forged_energy(atoms: str, n_electrons: int, job_ids: str,
+                          schmidt_rank: int = 2) -> str:
+    """
+    Turn finished quantum jobs back into a molecular energy.
+
+    Fetches the counts for each job and reconstructs the ground-state energy,
+    then compares it against the exact classical answer.
+
+    The job IDs must be in the SAME ORDER run_forged_energy returned them --
+    each one corresponds to a specific state preparation and measurement
+    basis, so reordering them scrambles the result.
+
+    Args:
+        atoms: same geometry used for the run
+        n_electrons: same electron count
+        job_ids: comma-separated job IDs, in submission order
+        schmidt_rank: same rank used for the run
+
+    Returns JSON with the measured energy, the exact reference, and the error
+    in kcal/mol (chemical accuracy is 1.0).
+    """
+    try:
+        _chem, _diag, _forging, _grouping = _load_qforge()
+        from qforge import experiment as qforge_experiment
+
+        ids = [j.strip() for j in job_ids.split(",") if j.strip()]
+        geometry = _parse_geometry(atoms)
+        built = qforge_experiment.build_experiment(
+            geometry, n_electrons, rank=schmidt_rank
+        )
+
+        if len(ids) != built.n_circuits:
+            return json.dumps({
+                "error": (
+                    f"got {len(ids)} job IDs but this experiment needs "
+                    f"{built.n_circuits}. The geometry, electron count and "
+                    "schmidt_rank must match the original run exactly."
+                ),
+            })
+
+        counts_per_circuit = []
+        for position, job_id in enumerate(ids):
+            response = json.loads(job_results(job_id))
+            if "counts" not in response:
+                return json.dumps({
+                    "error": (
+                        f"job {job_id} (position {position}) has no counts yet: "
+                        f"{response.get('status', response.get('error'))}"
+                    ),
+                    "note": "All jobs must be DONE before collecting.",
+                })
+            counts_per_circuit.append(response["counts"])
+
+        energy = qforge_experiment.reconstruct_energy(built, counts_per_circuit)
+        error_kcal = abs(energy - built.exact_energy) * 627.5094740631
+
+        return json.dumps({
+            "geometry": atoms,
+            "schmidt_rank": built.rank,
+            "circuits_used": built.n_circuits,
+            "measured_energy_hartree": round(float(energy), 6),
+            "exact_energy_hartree": round(float(built.exact_energy), 6),
+            "error_kcal_mol": round(float(error_kcal), 4),
+            "accuracy_floor_kcal_mol": round(built.accuracy_floor_kcal_mol, 4),
+            "reached_chemical_accuracy": bool(error_kcal <= 1.0),
+            "interpretation": (
+                "error_kcal_mol is the total; accuracy_floor_kcal_mol is the "
+                "part from Schmidt truncation alone. The difference is "
+                "hardware noise. Raising schmidt_rank lowers the floor; error "
+                "mitigation lowers the noise -- see recommend_error_mitigation."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 # --------------------------------------------------------------------------
 # API Key Authentication Middleware
 # --------------------------------------------------------------------------

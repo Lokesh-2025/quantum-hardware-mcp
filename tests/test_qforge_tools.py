@@ -186,3 +186,72 @@ def test_geometry_accepts_newlines():
     assert (
         newline_form["exact_energy_hartree"] == semicolon_form["exact_energy_hartree"]
     )
+
+
+# ------------------------------------------------ circuit building and running
+def test_build_forged_circuits_emits_valid_qasm():
+    """The whole point of these tools: real, parseable, runnable circuits."""
+    from qiskit import QuantumCircuit
+
+    result = call(server.build_forged_circuits, H2, 2, 2)
+    assert result["qasm"], "no circuits emitted"
+    assert len(result["qasm"]) == result["circuits"]
+    for qasm in result["qasm"]:
+        circuit = QuantumCircuit.from_qasm_str(qasm)   # parses, so submittable
+        assert circuit.num_qubits == result["molecule"]["qubits_per_circuit"]
+
+
+def test_forged_circuits_use_half_the_qubits():
+    """Entanglement forging's entire purpose."""
+    result = call(server.build_forged_circuits, H2, 2, 2)
+    assert result["molecule"]["qubits_per_circuit"] * 2 == result["molecule"]["qubits_direct"]
+
+
+def test_circuits_include_measurements():
+    """A circuit without measurement returns nothing from hardware."""
+    result = call(server.build_forged_circuits, H2, 2, 2)
+    assert all("measure" in qasm for qasm in result["qasm"])
+
+
+def test_build_runs_a_self_check():
+    """Circuits are replayed on a simulator before anyone spends queue time."""
+    result = call(server.build_forged_circuits, H2, 2, 2)
+    assert result["self_check"]["passed"] is True
+    # rank 2 is exact for H2, so only shot noise should remain
+    assert result["self_check"]["simulator_error_kcal_mol"] < 1.0
+
+
+def test_build_refuses_to_exceed_the_circuit_cap():
+    """Guard against silently generating hundreds of hardware jobs."""
+    result = json.loads(server.build_forged_circuits(H4, 4, 5, max_circuits=10))
+    assert "error" in result
+    assert result["circuits_required"] > 10
+
+
+def test_run_refuses_before_submitting_anything_oversized():
+    """The cap must trigger BEFORE any job is submitted.
+
+    Deliberately uses a device name that does not exist: if the guard works,
+    submission is never attempted and no credentials are needed.
+    """
+    result = json.loads(
+        server.run_forged_energy(H4, 4, "no_such_device", schmidt_rank=5,
+                                 max_circuits=5)
+    )
+    assert "error" in result
+    assert "max_circuits" in result["error"]
+
+
+def test_collect_rejects_a_mismatched_job_count():
+    """Job IDs map positionally to circuits, so the count must match exactly."""
+    result = json.loads(server.collect_forged_energy(H2, 2, "job1,job2", 2))
+    assert "error" in result
+    assert "job ID" in result["error"] or "job IDs" in result["error"]
+
+
+def test_full_rank_h2_circuits_are_exact_in_simulation():
+    """End-to-end: rank 2 reconstructs H2 exactly, so the measurement
+    reconstruction (Clifford frame, sign, beta-register signs) is correct."""
+    result = call(server.build_forged_circuits, H2, 2, 2)
+    assert result["accuracy_floor_kcal_mol"] == pytest.approx(0.0, abs=1e-3)
+    assert result["self_check"]["simulator_error_kcal_mol"] < 0.5

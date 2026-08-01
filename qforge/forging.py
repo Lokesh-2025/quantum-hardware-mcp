@@ -38,6 +38,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.circuit.library import StatePreparation
 from qiskit.quantum_info import Pauli, SparsePauliOp
 
 
@@ -59,18 +61,45 @@ class SchmidtDecomposition:
         return float(sum(self.coefficients[n] ** 2 for n in range(k)))
 
     def is_symmetric(self, k: int | None = None, tol: float = 1e-9) -> bool:
-        """True when the two halves are identical up to sign.
+        """True when the two halves match UP TO A PER-VECTOR SIGN.
 
-        When this holds, only ONE register needs to be measured on hardware --
-        an exact factor-of-two saving. It is true for symmetric molecules such
-        as an evenly spaced hydrogen chain.
+        When this holds, only ONE register needs measuring on hardware -- an
+        exact factor-of-two saving.
+
+        **Read this before reusing measurements.** "Up to a sign" is not
+        "identical". The magnitudes agree but individual vectors may be
+        negated, and those signs propagate into every off-diagonal matrix
+        element as ``B_nm = s_n s_m A_nm``. Reusing alpha results for beta
+        without applying :meth:`beta_signs` gave a 149 kcal/mol error against
+        a 2.76 kcal/mol truncation floor -- the energy was quietly wrong, not
+        obviously broken.
+
+        **Apply :func:`real_gauge` to the state first.** An eigensolver returns
+        an arbitrary global phase, and in that gauge the two halves are related
+        by a complex phase rather than a sign, so this returns False. Fix the
+        gauge and the relationship becomes a plain +-1.
         """
         k = k or self.rank
+        signs = self.beta_signs(k, tol=tol)
         return all(
-            np.allclose(np.abs(self.alpha_vectors[n]), np.abs(self.beta_vectors[n]),
-                        atol=tol)
+            np.allclose(self.alpha_vectors[n], signs[n] * self.beta_vectors[n],
+                        atol=tol * 10)
             for n in range(k)
         )
+
+    def beta_signs(self, k: int | None = None, tol: float = 1e-9) -> np.ndarray:
+        """Per-vector signs ``s_n`` with ``v_n = s_n * u_n``.
+
+        Apply as ``B = numpy.outer(s, s) * A`` to turn alpha-register matrix
+        elements into beta-register ones. Verified exact to ~1e-14.
+        """
+        k = k or self.rank
+        return np.array([
+            1.0
+            if np.allclose(self.alpha_vectors[n], self.beta_vectors[n], atol=tol)
+            else -1.0
+            for n in range(k)
+        ])
 
 
 def schmidt_decompose(psi: np.ndarray, n_qubits: int | None = None) -> SchmidtDecomposition:
@@ -206,3 +235,80 @@ def combine_cross_measurements(expectations: list[float]) -> complex:
     real = (expectations[0] - expectations[2]) / 2
     imag = (expectations[3] - expectations[1]) / 2
     return complex(real, imag)
+
+
+# --------------------------------------------------------------------------
+# circuits
+# --------------------------------------------------------------------------
+def state_preparation_circuit(vector: np.ndarray, name: str | None = None) -> QuantumCircuit:
+    """A runnable circuit preparing ``vector`` on half the register.
+
+    No measurement is appended -- callers add a basis rotation and measurement
+    for whichever observable they want (see :mod:`qforge.grouping`).
+
+    Qiskit's generic ``StatePreparation`` is used rather than a hand-optimised
+    ansatz. For the forged H4 fragment it transpiles to 11 two-qubit gates,
+    which is short enough to sit under typical hardware pricing floors; a
+    bespoke circuit exploiting the state's structure could plausibly do better
+    and has not been attempted.
+    """
+    vector = np.asarray(vector, dtype=complex)
+    norm = np.linalg.norm(vector)
+    if norm == 0:
+        raise ValueError("cannot prepare a zero vector")
+    vector = vector / norm
+
+    n_qubits = int(np.log2(vector.shape[0]))
+    if 2 ** n_qubits != vector.shape[0]:
+        raise ValueError(f"state dimension {vector.shape[0]} is not a power of two")
+
+    circuit = QuantumCircuit(n_qubits, name=name or "state_prep")
+    circuit.append(StatePreparation(vector), range(n_qubits))
+    return circuit
+
+
+def real_gauge(psi: np.ndarray) -> tuple[np.ndarray, float]:
+    """Remove the eigensolver's arbitrary global phase.
+
+    Eigensolvers return a state with an unphysical overall phase. A real
+    Hamiltonian's ground state can always be chosen real, and in that gauge
+    every matrix element is real -- so the two phase circuits that measure the
+    imaginary part measure nothing but noise, and can be dropped. That is a
+    44% circuit saving at Schmidt rank 5, verified to cost no accuracy.
+
+    Returns ``(real_state, residual_imaginary)``. A residual much above ~1e-10
+    means the state is genuinely complex and the saving does NOT apply.
+    """
+    pivot = int(np.argmax(np.abs(psi)))
+    rotated = psi * np.exp(-1j * np.angle(psi[pivot]))
+    return rotated.real.astype(complex), float(np.abs(rotated.imag).max())
+
+
+def forged_state_preparations(
+    decomposition: SchmidtDecomposition, k: int, real_gauge_applied: bool = True
+) -> list[tuple[tuple, np.ndarray]]:
+    """Every state the experiment must prepare, as ``(key, vector)`` pairs.
+
+    Keys are ``("diag", n, n, 0)`` or ``("cross", n, m, phase)``, which is what
+    :func:`qforge.experiment.reconstruct_energy` uses to reassemble the matrix
+    elements.
+
+    With ``real_gauge_applied`` the phase circuits are k = 0, 2 only (two per
+    Schmidt pair). Set it False to emit all four, which is required when the
+    state is genuinely complex.
+    """
+    phases = (0, 2) if real_gauge_applied else (0, 1, 2, 3)
+    preparations: list[tuple[tuple, np.ndarray]] = [
+        (("diag", n, n, 0), decomposition.alpha_vectors[n]) for n in range(k)
+    ]
+    for n in range(k):
+        for m in range(n + 1, k):
+            for phase in phases:
+                state = (
+                    decomposition.alpha_vectors[n]
+                    + (1j ** phase) * decomposition.alpha_vectors[m]
+                ) / np.sqrt(2)
+                preparations.append(
+                    (("cross", n, m, phase), state / np.linalg.norm(state))
+                )
+    return preparations

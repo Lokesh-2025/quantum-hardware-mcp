@@ -50,6 +50,7 @@ because each of them cost real debugging time to discover.
 from qforge import (
     chemistry,
     diagnostics,
+    experiment,
     forging,
     fragmentation,
     grouping,
@@ -62,6 +63,7 @@ __version__ = "0.1.0"
 __all__ = [
     "chemistry",
     "integrals",
+    "experiment",
     "forging",
     "fragmentation",
     "grouping",

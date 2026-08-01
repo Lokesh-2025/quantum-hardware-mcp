@@ -51,6 +51,24 @@ the [`qforge`](qforge/) library in this repo; nothing is looked up.
 | `plan_quantum_chemistry_run` | Given a molecule and a budget, works out the most accurate result you can actually buy: Schmidt rank, circuit count, cost, expected error |
 | `recommend_error_mitigation` | Which mitigation techniques are worth applying for a given circuit and device noise — including the ones measured **not** to help, so you skip them |
 | `estimate_circuit_error_ceiling` | Bounds the error on *any* observable from one fidelity number, so you can tell before running whether a job can possibly reach chemical accuracy |
+| `build_forged_circuits` | Emits the actual OpenQASM circuits for a forged ground-state calculation — each acting on **half** the qubits the molecule would otherwise need — plus a simulator self-check confirming they reconstruct the right energy |
+| `run_forged_energy` | Builds the circuits and submits them to a named device via `submit_job`, returning ordered job IDs |
+| `collect_forged_energy` | Fetches the finished jobs and reconstructs the molecular energy, compared against the exact classical answer |
+
+The last three complete the loop: **molecule → circuits → hardware → energy**.
+
+```
+run_forged_energy(atoms="H 0 0 0; H 0 0 0.74", n_electrons=2,
+                  device_name="ibm_fez", schmidt_rank=2)
+→ 8 circuits on 2 qubits (H2 would otherwise need 4), job IDs returned
+collect_forged_energy(..., job_ids="...")
+→ measured energy vs exact −1.137284 Ha
+```
+
+Circuits are replayed on a local simulator before anything is submitted — a
+wrong measurement basis or sign produces a quietly wrong energy rather than an
+obvious failure, so `run_forged_energy` refuses to submit if the self-check
+fails. Job counts are capped by default; raise `max_circuits` deliberately.
 
 Example — *"can I run H4 on $3,000 of credits?"*:
 
