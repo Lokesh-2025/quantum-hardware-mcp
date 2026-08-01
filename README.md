@@ -38,6 +38,34 @@ Running quantum experiments is expensive in two ways: **time** (queue wait) and 
 | `circuit_report` | Dry-run analysis — transpiles your circuit and returns gate counts, qubit mapping, per-pair CX errors, and an estimated fidelity. No queue time. |
 | `debug_circuit` | Bug detector — checks for missing measurements, decoherence violations, qubit mismatches, and unentangled qubits before you waste hours in a queue. Returns severity-ranked issues with plain-English fixes. |
 
+### Quantum chemistry planning (`qforge`)
+
+The tools above answer *"what hardware exists, and is my circuit valid?"*. These
+answer the question a chemist starts with: *"I have this molecule — can I run it,
+by what method, and what will it cost?"* All values are computed from geometry by
+the [`qforge`](qforge/) library in this repo; nothing is looked up.
+
+| Tool | What it does |
+| ---- | ------------ |
+| `analyze_molecule` | Builds the qubit Hamiltonian from atom positions and reports how far entanglement forging and Pauli grouping cut the problem down — plus the accuracy floor at each truncation rank |
+| `plan_quantum_chemistry_run` | Given a molecule and a budget, works out the most accurate result you can actually buy: Schmidt rank, circuit count, cost, expected error |
+| `recommend_error_mitigation` | Which mitigation techniques are worth applying for a given circuit and device noise — including the ones measured **not** to help, so you skip them |
+| `estimate_circuit_error_ceiling` | Bounds the error on *any* observable from one fidelity number, so you can tell before running whether a job can possibly reach chemical accuracy |
+
+Example — *"can I run H4 on $3,000 of credits?"*:
+
+```
+plan_quantum_chemistry_run(
+    atoms="H 0 0 0; H 1 0 0; H 2 0 0; H 3 0 0",
+    n_electrons=4,
+    budget_usd=3000,
+)
+→ Schmidt rank 4: 80 circuits, ~$2,063, floor 1.53 kcal/mol
+```
+
+Requires `qiskit-nature` (in `requirements.txt`). The tools import lazily, so the
+rest of the server still runs if it is missing.
+
 ### `compare_devices` sort modes
 
 | `sort_by` | What it optimises |

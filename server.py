@@ -31,6 +31,7 @@ import anyio
 from datetime import datetime, timezone
 from typing import Optional
 
+import numpy as np
 from qiskit import QuantumCircuit
 from qiskit import qasm3 as qiskit_qasm3
 from qiskit.quantum_info import SparsePauliOp
@@ -1637,6 +1638,411 @@ def debug_circuit(qasm_string: str, device_name: str = "",
         "summary": summary,
         "safe_to_submit": safe,
     }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Quantum chemistry planning tools (qforge)
+# --------------------------------------------------------------------------
+# The tools above answer "what hardware exists and is my circuit valid?".
+# These answer the question a chemist actually starts with: "I have this
+# molecule -- can I run it, by what method, and what will it cost?"
+#
+# Everything is computed from geometry using the qforge library in this repo.
+# No lookup tables of answers.
+
+# Guard rails. Exact diagonalisation cost grows as 2^n, so a careless request
+# would hang the server rather than return an error.
+_QFORGE_MAX_QUBITS = 16
+_QFORGE_MAX_ATOMS = 10
+
+
+def _load_qforge():
+    """Import qforge on demand.
+
+    Kept lazy so the server still starts (and every other tool still works) if
+    the optional chemistry dependencies are missing.
+    """
+    try:
+        from qforge import chemistry, diagnostics, forging, grouping
+        return chemistry, diagnostics, forging, grouping
+    except ImportError as exc:
+        raise RuntimeError(
+            f"qforge unavailable ({exc}). Install with: pip install qiskit-nature"
+        ) from exc
+
+
+def _parse_geometry(atoms: str):
+    """Parse 'H 0 0 0; H 0 0 0.74' into [("H", (0.0, 0.0, 0.0)), ...].
+
+    Accepts ';' or newline between atoms. Positions are in Angstrom.
+    """
+    geometry = []
+    for chunk in atoms.replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split()
+        if len(parts) != 4:
+            raise ValueError(
+                f"cannot parse atom {chunk!r} -- expected 'SYMBOL X Y Z', "
+                "e.g. 'H 0 0 0.74'"
+            )
+        symbol, x, y, z = parts
+        geometry.append((symbol, (float(x), float(y), float(z))))
+    if not geometry:
+        raise ValueError("no atoms given")
+    if len(geometry) > _QFORGE_MAX_ATOMS:
+        raise ValueError(
+            f"{len(geometry)} atoms exceeds the {_QFORGE_MAX_ATOMS}-atom limit "
+            "for exact solving; use fragmentation for larger systems"
+        )
+    return geometry
+
+
+def _build_and_solve(atoms: str, n_electrons: int):
+    """Shared front half: geometry -> Hamiltonian -> exact ground state."""
+    chemistry, _diagnostics, forging, _grouping = _load_qforge()
+    geometry = _parse_geometry(atoms)
+    molecule = chemistry.build_molecule(geometry, n_electrons=n_electrons)
+    if molecule.n_qubits > _QFORGE_MAX_QUBITS:
+        raise ValueError(
+            f"{molecule.n_qubits} qubits exceeds the {_QFORGE_MAX_QUBITS}-qubit "
+            "limit for exact diagonalisation on this server"
+        )
+    energy, psi = molecule.exact_ground_state()
+
+    # Remove the arbitrary global phase eigensolvers return. In the resulting
+    # real gauge every matrix element is real, which halves the number of
+    # phase circuits entanglement forging needs.
+    pivot = int(np.argmax(np.abs(psi)))
+    psi = (psi * np.exp(-1j * np.angle(psi[pivot]))).real.astype(complex)
+    return molecule, energy, psi
+
+
+@mcp.tool()
+def analyze_molecule(atoms: str, n_electrons: int) -> str:
+    """
+    Work out what a molecule costs to simulate on a quantum computer.
+
+    Computes the qubit Hamiltonian from geometry, then reports how far
+    entanglement forging and Pauli grouping can cut the problem down.
+
+    Args:
+        atoms: geometry in Angstrom, e.g. "H 0 0 0; H 0 0 0.74"
+               (separate atoms with ';' or newlines)
+        n_electrons: total electrons, e.g. 2 for H2
+
+    Returns JSON with qubit counts before and after forging, the Schmidt
+    spectrum (which determines how much truncation is affordable), and the
+    number of measurement circuits needed per state preparation.
+    """
+    try:
+        chemistry, _diag, forging, grouping = _load_qforge()
+        molecule, energy, psi = _build_and_solve(atoms, n_electrons)
+
+        schmidt = forging.schmidt_decompose(psi, molecule.n_qubits)
+        terms = forging.split_pauli_terms(molecule.hamiltonian)
+        half = molecule.n_qubits // 2
+        alpha_labels = sorted({a for a, _, _ in terms})
+
+        general = grouping.build_measurement_groups(alpha_labels, half, qubit_wise=False)
+        qubit_wise = grouping.build_measurement_groups(alpha_labels, half, qubit_wise=True)
+
+        # accuracy floor at each truncation rank -- purely classical, so it
+        # tells you the BEST possible result before hardware noise is added
+        alpha_mats = forging.matrix_elements(schmidt.alpha_vectors, alpha_labels, schmidt.rank)
+        beta_mats = forging.matrix_elements(
+            schmidt.beta_vectors, [b for _, b, _ in terms], schmidt.rank
+        )
+        floors = {}
+        for rank in range(1, min(schmidt.rank, 6) + 1):
+            approx = forging.forged_energy(
+                terms, schmidt.coefficients, alpha_mats, beta_mats,
+                molecule.nuclear_repulsion, rank,
+            )
+            floors[rank] = round(abs(approx - energy) * 627.5094740631, 4)
+
+        return json.dumps({
+            "geometry": atoms,
+            "n_electrons": n_electrons,
+            "exact_energy_hartree": round(float(energy), 6),
+            "hartree_fock_energy": round(float(molecule.hf_energy), 6),
+            "correlation_energy_hartree": round(
+                float(energy - molecule.hf_energy - 0.0), 6
+            ),
+            "qubits_direct": molecule.n_qubits,
+            "qubits_with_forging": half,
+            "hamiltonian_terms": len(molecule.hamiltonian),
+            "unique_pauli_labels_per_register": len(alpha_labels),
+            "measurement_circuits_qubit_wise": len(qubit_wise),
+            "measurement_circuits_general_commuting": len(general),
+            "schmidt_rank": schmidt.rank,
+            "schmidt_coefficients": [round(float(c), 5) for c in schmidt.coefficients[:8]],
+            "halves_symmetric": bool(schmidt.is_symmetric()),
+            "accuracy_floor_kcal_mol_by_rank": floors,
+            "note": (
+                "accuracy_floor is the classical truncation error at each Schmidt "
+                "rank -- the best achievable before any hardware noise. "
+                "Chemical accuracy is 1.0 kcal/mol."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def plan_quantum_chemistry_run(atoms: str, n_electrons: int,
+                               budget_usd: float = 10000.0,
+                               price_per_circuit: float = 25.79) -> str:
+    """
+    Given a molecule and a budget, recommend how to actually run it.
+
+    Answers the practical question: what is the most accurate result I can buy
+    for this much money? Works through every Schmidt rank, applies the circuit
+    optimisations, and reports which options fit.
+
+    Args:
+        atoms: geometry in Angstrom, e.g. "H 0 0 0; H 0 0 0.74"
+        n_electrons: total electrons
+        budget_usd: available credits (default 10000)
+        price_per_circuit: hardware price per circuit. 25.79 is IonQ Forte's
+            measured per-circuit floor for shallow circuits; check current
+            rates rather than trusting this default.
+
+    Returns JSON with a ranked plan, the recommended option, and what error
+    mitigation to apply.
+    """
+    try:
+        _chem, _diag, forging, grouping = _load_qforge()
+        molecule, energy, psi = _build_and_solve(atoms, n_electrons)
+
+        schmidt = forging.schmidt_decompose(psi, molecule.n_qubits)
+        terms = forging.split_pauli_terms(molecule.hamiltonian)
+        half = molecule.n_qubits // 2
+        alpha_labels = sorted({a for a, _, _ in terms})
+        groups = grouping.build_measurement_groups(alpha_labels, half, qubit_wise=False)
+        n_bases = len(groups)
+
+        alpha_mats = forging.matrix_elements(schmidt.alpha_vectors, alpha_labels, schmidt.rank)
+        beta_mats = forging.matrix_elements(
+            schmidt.beta_vectors, [b for _, b, _ in terms], schmidt.rank
+        )
+
+        options = []
+        for rank in range(1, min(schmidt.rank, 8) + 1):
+            # real gauge: 2 phase circuits per Schmidt pair, not 4
+            preps = rank + 2 * (rank * (rank - 1) // 2)
+            circuits = preps * n_bases
+            cost = circuits * price_per_circuit
+            approx = forging.forged_energy(
+                terms, schmidt.coefficients, alpha_mats, beta_mats,
+                molecule.nuclear_repulsion, rank,
+            )
+            options.append({
+                "schmidt_rank": rank,
+                "state_preparations": preps,
+                "circuits": circuits,
+                "estimated_cost_usd": round(cost, 2),
+                "accuracy_floor_kcal_mol": round(abs(approx - energy) * 627.5094740631, 4),
+                "fits_budget": bool(cost <= budget_usd),
+                "reaches_chemical_accuracy": bool(
+                    abs(approx - energy) * 627.5094740631 <= 1.0
+                ),
+            })
+
+        affordable = [o for o in options if o["fits_budget"]]
+        best = min(affordable, key=lambda o: o["accuracy_floor_kcal_mol"]) if affordable else None
+
+        return json.dumps({
+            "molecule": {
+                "geometry": atoms,
+                "exact_energy_hartree": round(float(energy), 6),
+                "qubits_direct": molecule.n_qubits,
+                "qubits_with_forging": half,
+                "measurement_bases": n_bases,
+            },
+            "budget_usd": budget_usd,
+            "options": options,
+            "recommended": best,
+            "recommendation_note": (
+                None if best is None else
+                f"Schmidt rank {best['schmidt_rank']}: {best['circuits']} circuits, "
+                f"~${best['estimated_cost_usd']:,.0f}, floor "
+                f"{best['accuracy_floor_kcal_mol']} kcal/mol"
+            ),
+            "warning": (
+                "No option fits this budget." if best is None else None
+            ),
+            "cost_assumptions": (
+                "Assumes a flat per-circuit price, which holds only while circuits "
+                "stay below the hardware's gate-count pricing threshold (~23 "
+                "two-qubit gates on IonQ Forte). Zero-noise extrapolation folds "
+                "circuits and typically pushes past that, costing several times "
+                "more -- price ZNE separately with real folded gate counts."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def recommend_error_mitigation(two_qubit_gates: int,
+                               two_qubit_error_rate: float = 0.002,
+                               readout_error_rate: float = 0.0,
+                               conserves_particle_number: bool = True) -> str:
+    """
+    Recommend which error-mitigation techniques are worth applying.
+
+    Based on measured results from this project, including the ones that did
+    NOT work -- so you skip techniques that cost circuits and return nothing.
+
+    Args:
+        two_qubit_gates: two-qubit gate count in the circuit
+        two_qubit_error_rate: per-gate error, e.g. 0.002 for trapped ion,
+            0.03 for typical superconducting
+        readout_error_rate: measurement bit-flip probability (0 if unknown)
+        conserves_particle_number: True for chemistry circuits, where symmetry
+            verification is available
+
+    Returns JSON with ranked recommendations and expected circuit overhead.
+    """
+    try:
+        circuit_error = 1.0 - (1.0 - two_qubit_error_rate) ** two_qubit_gates
+        recommendations = []
+
+        recommendations.append({
+            "technique": "readout_error_mitigation",
+            "recommended": readout_error_rate > 0.001,
+            "circuit_overhead": "none (classical post-processing)",
+            "expected_benefit": "2.5-3.5x error reduction, measured",
+            "why": (
+                "Free to apply and stacks with everything else."
+                if readout_error_rate > 0.001
+                else "Readout error negligible or unspecified; little to gain."
+            ),
+        })
+
+        recommendations.append({
+            "technique": "symmetry_verification",
+            "recommended": bool(conserves_particle_number),
+            "circuit_overhead": "none (discards invalid shots, ~1% loss)",
+            "expected_benefit": "2-4x error reduction, measured",
+            "why": (
+                "Shots landing on the wrong particle number are provably wrong "
+                "and free to discard. ONLY valid in the computational basis -- "
+                "X/Y rotations do not conserve particle number, and "
+                "postselecting after them made an energy ~40x worse."
+                if conserves_particle_number
+                else "No conserved quantity available to check against."
+            ),
+        })
+
+        needs_zne = circuit_error > 0.01
+        recommendations.append({
+            "technique": "zero_noise_extrapolation",
+            "recommended": bool(needs_zne),
+            "circuit_overhead": "3x circuits, and folded circuits are 3-5x deeper",
+            "expected_benefit": "~20 kcal/mol -> 0.57 kcal/mol, measured on H4",
+            "why": (
+                "Circuit error is high enough that raw results will miss "
+                "chemical accuracy."
+                if needs_zne
+                else "Circuit is shallow enough that raw results may suffice; "
+                     "try unmitigated first and save the cost."
+            ),
+            "cost_warning": (
+                "Folding multiplies noise by 2*folds-1, not folds -- 3 folds "
+                "means 5x the gates. On gate-billed hardware this dominates "
+                "cost, typically ~85% of a full experiment."
+            ),
+        })
+
+        recommendations.append({
+            "technique": "pauli_twirling",
+            "recommended": False,
+            "circuit_overhead": "many randomised circuit variants",
+            "expected_benefit": "none measured against depolarising noise",
+            "why": (
+                "Twirling converts coherent error into stochastic error. Tested "
+                "here against a depolarising noise model with no improvement, "
+                "converged over 600 twirls. Only worth revisiting on hardware "
+                "with confirmed coherent error."
+            ),
+        })
+
+        return json.dumps({
+            "circuit_profile": {
+                "two_qubit_gates": two_qubit_gates,
+                "two_qubit_error_rate": two_qubit_error_rate,
+                "estimated_circuit_error": round(circuit_error, 5),
+                "estimated_fidelity": round(1.0 - circuit_error, 5),
+            },
+            "recommendations": recommendations,
+            "apply_in_order": [
+                r["technique"] for r in recommendations if r["recommended"]
+            ],
+            "note": (
+                "Recommendations come from measurements in this project, not "
+                "general theory. The negative results are included deliberately "
+                "so time is not spent rediscovering them."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def estimate_circuit_error_ceiling(two_qubit_gates: int, one_qubit_gates: int = 0,
+                                   two_qubit_error_rate: float = 0.002,
+                                   one_qubit_error_rate: float = 0.00005) -> str:
+    """
+    Bound the error on ANY observable before running the circuit.
+
+    One fidelity number bounds every measurement at once, so you can tell in
+    advance whether a run can possibly reach the accuracy you need -- without
+    simulating each observable separately.
+
+    Args:
+        two_qubit_gates: count of two-qubit gates
+        one_qubit_gates: count of one-qubit gates
+        two_qubit_error_rate: per-gate error (0.002 trapped ion, 0.03 typical
+            superconducting)
+        one_qubit_error_rate: per-gate error
+
+    Returns JSON with estimated fidelity and the resulting error ceiling.
+    """
+    try:
+        _chem, diagnostics, _forging, _grouping = _load_qforge()
+        fidelity = (
+            (1.0 - two_qubit_error_rate) ** two_qubit_gates
+            * (1.0 - one_qubit_error_rate) ** one_qubit_gates
+        )
+        ceiling = diagnostics.ceiling_from_fidelity(fidelity)
+        chemical_accuracy = 1.0 / 627.5094740631
+
+        return json.dumps({
+            "gates": {"two_qubit": two_qubit_gates, "one_qubit": one_qubit_gates},
+            "estimated_fidelity": round(float(fidelity), 6),
+            "error_ceiling_any_observable": round(float(ceiling), 6),
+            "chemical_accuracy_hartree": round(chemical_accuracy, 6),
+            "single_observable_within_chemical_accuracy": bool(
+                ceiling <= chemical_accuracy
+            ),
+            "interpretation": (
+                "The ceiling bounds |<P>_noisy - <P>_ideal| for every Pauli "
+                "observable. It is an upper bound, typically 1.4-2.2x looser "
+                "than reality, so exceeding it means the run CANNOT reach the "
+                "target, while satisfying it does not guarantee success. "
+                "Validated across 55 configurations without a violation."
+            ),
+            "caveat": (
+                "Derived from a gate-count fidelity estimate, which is looser "
+                "than a full density-matrix calculation (measured 2-6x looser). "
+                "Use for pre-flight screening, not as a final error bar."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 # --------------------------------------------------------------------------
