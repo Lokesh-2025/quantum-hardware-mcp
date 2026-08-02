@@ -104,8 +104,20 @@ def basis_rotation_circuit(labels, n_qubits: int) -> QuantumCircuit:
 
 # --------------------------------------------------- Clifford diagonalisation
 def _label_to_symplectic(label: str) -> np.ndarray:
-    x = np.array([1 if c in "XY" else 0 for c in label], dtype=np.int8)
-    z = np.array([1 if c in "ZY" else 0 for c in label], dtype=np.int8)
+    """Pauli label -> symplectic ``[x | z]`` vector indexed BY QUBIT.
+
+    Qiskit writes labels most-significant-qubit first: ``"XZ"`` means X on
+    qubit 1 and Z on qubit 0. The Clifford tableau, by contrast, is indexed by
+    qubit number, so the label must be reversed before mapping.
+
+    Getting this wrong is a silent, size-dependent bug. A group that happens to
+    be closed under label reversal still diagonalises correctly, which is why
+    a 4-qubit test set passed while every 6-qubit molecule (LiH, H2O) failed
+    verification.
+    """
+    reversed_label = label[::-1]
+    x = np.array([1 if c in "XY" else 0 for c in reversed_label], dtype=np.int8)
+    z = np.array([1 if c in "ZY" else 0 for c in reversed_label], dtype=np.int8)
     return np.concatenate([x, z])
 
 
@@ -130,7 +142,12 @@ def _independent_subset(vectors) -> list[np.ndarray]:
 
 
 def _search_basis(n: int) -> list[np.ndarray]:
-    """Weight-1 and weight-2 Paulis: enough to span the symplectic space."""
+    """Weight-1 and weight-2 Paulis, as symplectic vectors.
+
+    Weight-1 alone spans the 2n-dimensional symplectic space; the weight-2
+    entries widen the search so the destabiliser hunt has more candidates to
+    choose from.
+    """
     labels = []
     for i in range(n):
         for p in "XZY":

@@ -271,3 +271,37 @@ def test_shot_noise_shrinks_with_more_shots():
     assert mitigation.shot_noise_sigma(0.0, 10_000) < mitigation.shot_noise_sigma(0.0, 100)
     # observables pinned near +-1 are far cheaper to measure
     assert mitigation.shot_noise_sigma(0.99, 1000) < mitigation.shot_noise_sigma(0.0, 1000)
+
+
+def test_clifford_diagonalization_is_endian_correct():
+    """Regression: Pauli labels are most-significant-qubit first.
+
+    An earlier version indexed labels left-to-right when building the
+    symplectic vector, which is backwards relative to the Clifford tableau.
+    The bug was invisible on groups closed under label reversal (a 4-qubit
+    test set passed) and broke every larger molecule -- LiH and H2O failed
+    verification outright. This asserts on an ASYMMETRIC group, where the
+    reversal genuinely matters.
+    """
+    labels = ["XZZXXX", "ZZXXZZ"]
+    clifford = grouping.diagonalizing_clifford(labels, 6)
+    assert grouping.verify_diagonalization(clifford, labels)
+
+
+@pytest.mark.parametrize(
+    "geometry,n_electrons,n_qubits",
+    [
+        ([("H", (0, 0, 0)), ("H", (0, 0, 0.74))], 2, 4),
+        ([("He", (0, 0, 0)), ("H", (0, 0, 0.772))], 2, 4),
+        ([("Li", (0, 0, 0)), ("H", (0, 0, 1.6))], 4, 12),
+    ],
+)
+def test_grouping_works_across_molecule_sizes(geometry, n_electrons, n_qubits):
+    """Diagonalisation must hold for real molecules, not just hand-picked
+    Pauli sets -- including heteronuclear ones and larger registers."""
+    molecule = chemistry.build_molecule(geometry, n_electrons=n_electrons)
+    assert molecule.n_qubits == n_qubits
+    terms = forging.split_pauli_terms(molecule.hamiltonian)
+    labels = sorted({a for a, _, _ in terms})
+    groups = grouping.build_measurement_groups(labels, molecule.n_qubits // 2)
+    assert all(group.verified for group in groups)
