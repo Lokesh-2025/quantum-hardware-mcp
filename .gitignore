@@ -1,6 +1,9 @@
 # --- SECRETS (never commit these) ---
 .env
 
+# --- Local AI instructions (private, not for GitHub) ---
+CLAUDE.md
+
 # --- Python ---
 __pycache__/
 *.py[cod]

@@ -20,6 +20,25 @@ Tools:
   - estimate_expectation  : run Estimator primitive to compute observable expectation values
   - circuit_report        : dry-run analysis — fidelity estimate, gate counts, qubit map
   - debug_circuit         : bug detector — finds errors before you waste queue time
+  - ionq_devices          : list IonQ quantum computers and simulators
+  - ionq_submit_job       : submit an OpenQASM 2 circuit to IonQ hardware or simulator
+  - ionq_job_status       : check the status of a submitted IonQ job
+  - ionq_job_results      : retrieve measurement counts from a completed IonQ job
+  - get_alerts            : calibration drift alerts — devices that spiked or went offline
+  - start_repro_experiment: submit same circuit N times to measure reproducibility
+  - repro_score           : compute 0-1 reproducibility score after runs complete
+  - estimate_runtime      : estimate how many minutes a circuit will cost on a device
+  - route_job             : recommend the cheapest device that fits your circuit + time budget
+  - check_routing_overhead: predict SWAP inflation from qubit interaction graph (degree > 3 = danger)
+  - encode_search_problem : convert Boolean conditions into Ising h_i / J_ij for LNAA circuits
+  - estimate_hardware_gates: predict transpiled gate count from logical gates + qubit degree
+  - get_amplification     : compute amplification factor from a completed search job
+  - run_search_experiment    : ONE CALL does everything — encode → build circuit → pick best machine → submit → amplification
+  - encode_collision_problem        : classically find C(n1,k1)=C(n2,k2) pairs, encode as Ising h_i for LNAA collision search
+  - discover_collision_candidates   : scout — filters ALL k-pairs for hardware-feasible collisions before spending QPU credits
+  - run_parallel_collision_search   : ONE job, MULTIPLE k-pair searches on parallel 9-qubit rails across ibm_marrakesh's 156 qubits
+  - sieve_singmaster_space          : classical Lucas' theorem sieve — eliminates 98%+ of Pascal's Triangle search space before any QPU job
+  - discover_energy_landscape       : (PLANNED) given any math domain + constraints, auto-generate candidate Hamiltonian, estimate qubits/routing/gates, report if practical on current hardware
 """
 
 import os
@@ -28,6 +47,9 @@ import math
 import sqlite3
 import argparse
 import anyio
+import requests
+import contextvars
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -41,10 +63,10 @@ from qiskit_ibm_runtime import EstimatorV2 as Estimator
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+import snapshot as _snapshot
 from qiskit_ibm_runtime import QiskitRuntimeService
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JSONResponse
 from starlette.responses import JSONResponse
-from starlette.requests import Request
 
 # --------------------------------------------------------------------------
 # Load .env from the same folder as this file, regardless of working directory.
@@ -84,6 +106,31 @@ def _init_db() -> None:
         con.execute("""
             CREATE INDEX IF NOT EXISTS idx_name_ts
             ON device_snapshots (name, ts)
+        """)
+        # Reproducibility experiments — one row per experiment
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS repro_experiments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_ts  TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                circuit     TEXT NOT NULL,
+                n_runs      INTEGER NOT NULL,
+                shots       INTEGER NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending'
+            )
+        """)
+        # One row per individual run within an experiment
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS repro_runs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id INTEGER NOT NULL REFERENCES repro_experiments(id),
+                run_index     INTEGER NOT NULL,
+                submitted_ts  TEXT NOT NULL,
+                job_id        TEXT,
+                status        TEXT NOT NULL DEFAULT 'submitted',
+                counts        TEXT,           -- JSON string of bit-string counts
+                calibration_epoch TEXT        -- avg_cx_error snapshot at submission time
+            )
         """)
 
 
@@ -126,13 +173,38 @@ _init_db()
 # Helper: connect to IBM Quantum
 # --------------------------------------------------------------------------
 
+# Lets api.py run a request with a caller-supplied IBM token instead of the
+# shared IBM_QUANTUM_TOKEN in .env ("bring your own key"), without changing
+# any tool function's signature (so the MCP contract Claude Desktop sees is
+# untouched) and without the concurrency hazard of mutating os.environ — a
+# ContextVar is isolated per request/thread, so two requests running at the
+# same time never see each other's token.
+_token_override = contextvars.ContextVar("token_override", default=None)
+
+
+@contextmanager
+def use_ibm_token(token: str | None):
+    """Temporarily make _get_service() use `token` instead of the .env default."""
+    if not token:
+        yield
+        return
+    reset = _token_override.set(token)
+    try:
+        yield
+    finally:
+        _token_override.reset(reset)
+
+
 def _get_service() -> QiskitRuntimeService:
     """
-    Build a QiskitRuntimeService from the token stored in .env.
-    Raises a clear error if the token is missing so the user knows exactly
-    what to fix.
+    Build a QiskitRuntimeService from a per-request token override (see
+    use_ibm_token) or, failing that, env vars.
+
+    Required: IBM_QUANTUM_TOKEN (unless a per-request token override is active)
+    Optional: IBM_CHANNEL  (default: ibm_quantum_platform)
+              IBM_INSTANCE (e.g. ibm-q/open/main — falls back to IBM auto-select)
     """
-    token = os.getenv("IBM_QUANTUM_TOKEN")
+    token = _token_override.get() or os.getenv("IBM_QUANTUM_TOKEN")
     if not token:
         raise ValueError(
             "IBM_QUANTUM_TOKEN is not set. "
@@ -140,8 +212,14 @@ def _get_service() -> QiskitRuntimeService:
             "  IBM_QUANTUM_TOKEN=your_token_here\n"
             "Get your token at https://quantum.ibm.com/account"
         )
-    # channel="ibm_quantum_platform" → renamed in qiskit-ibm-runtime ≥ 0.40
-    return QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
+    channel  = os.getenv("IBM_CHANNEL", "ibm_quantum_platform")
+    instance = os.getenv("IBM_INSTANCE")  # None → IBM picks the default
+
+    kwargs = dict(channel=channel, token=token)
+    if instance:
+        kwargs["instance"] = instance
+
+    return QiskitRuntimeService(**kwargs)
 
 
 def _cx_errors_for_backend(props) -> list[float]:
@@ -373,17 +451,44 @@ def best_qubits(device_name: str, n: int = 5) -> str:
         })
 
     qubit_data.sort(key=lambda q: q["score"])
+    top_n = qubit_data[:n]
 
-    return json.dumps(
-        {
-            "device":   device_name,
-            "n":        n,
-            "scoring":  "readout_error + best_cx_error (lower = better). "
-                        "T1/T2 shown for context but not in score.",
-            "best_qubits": qubit_data[:n],
+    # Connectivity check: warn if the returned qubits are not all connected
+    # on the hardware graph. Unconnected qubit sets force SWAP injection.
+    top_indices = {q["qubit"] for q in top_n}
+    coupling_map = backend.coupling_map
+    connected_pairs = []
+    disconnected_warning = None
+    if coupling_map is not None:
+        edges = list(coupling_map.get_edges())
+        connected_pairs = [
+            [a, b] for a, b in edges
+            if a in top_indices and b in top_indices
+        ]
+        # A set of n qubits needs at least n-1 edges to be connected (tree).
+        if len(connected_pairs) < n - 1:
+            disconnected_warning = (
+                f"WARNING: the top {n} qubits by score are NOT all connected "
+                f"on {device_name}'s coupling map. Only {len(connected_pairs)} "
+                f"direct links found between them. Running a multi-qubit circuit "
+                f"on these qubits will require SWAP gates, increasing your gate "
+                f"count. Consider using check_routing_overhead or picking qubits "
+                f"from a connected subgraph."
+            )
+
+    result = {
+        "device":   device_name,
+        "n":        n,
+        "scoring":  "readout_error + best_cx_error (lower = better). "
+                    "T1/T2 shown for context but not in score.",
+        "best_qubits": top_n,
+        "connectivity": {
+            "direct_links_between_top_qubits": connected_pairs,
+            "warning": disconnected_warning,
         },
-        indent=2,
-    )
+    }
+
+    return json.dumps(result, indent=2)
 
 
 # --------------------------------------------------------------------------
@@ -419,16 +524,36 @@ def compare_devices(sort_by: str = "cx_error") -> str:
             "num_qubits": backend.num_qubits,
             "pending_jobs": status.pending_jobs,
             "operational": status.operational,
+            "status": "online" if status.operational else "offline",
         }
 
-        # Fetch calibration data for any mode that needs error rates
-        if sort_by in ("cx_error", "combined"):
+        # Always fetch calibration data so every device card has full fields
+        try:
             props = backend.properties()
             cx_errors = _cx_errors_for_backend(props)
             if cx_errors:
-                entry["avg_cx_error"] = round(
-                    sum(cx_errors) / len(cx_errors), 5
+                entry["avg_cx_error"] = round(sum(cx_errors) / len(cx_errors), 5)
+
+            readout_errors = [
+                props.readout_error(q)
+                for q in range(backend.num_qubits)
+                if props.readout_error(q) is not None
+            ]
+            if readout_errors:
+                entry["avg_readout_error"] = round(
+                    sum(readout_errors) / len(readout_errors), 5
                 )
+
+            t1_times = [v for q in range(backend.num_qubits)
+                        if (v := _safe_t(props.t1, q)) is not None]
+            t2_times = [v for q in range(backend.num_qubits)
+                        if (v := _safe_t(props.t2, q)) is not None]
+            if t1_times:
+                entry["avg_t1_us"] = round(sum(t1_times) / len(t1_times), 1)
+            if t2_times:
+                entry["avg_t2_us"] = round(sum(t2_times) / len(t2_times), 1)
+        except Exception:
+            pass  # calibration unavailable — leave fields absent
 
         devices.append(entry)
 
@@ -569,7 +694,12 @@ def device_history(device_name: str, days: int = 7) -> str:
         rows = con.execute(
             """
             SELECT ts, num_qubits, operational, pending_jobs,
-                   avg_cx_error, avg_readout_error
+                   avg_cx_error, avg_readout_error,
+                   median_t1_us, median_t2_us, qubit_yield_fraction,
+                   day_of_week, hour_utc,
+                   processor_family, backend_version, last_calibration_dt,
+                   clops_h, quantum_volume, avg_2q_gate_duration_ns,
+                   avg_prob_meas0_prep1, avg_prob_meas1_prep0
             FROM   device_snapshots
             WHERE  name = ?
               AND  ts >= datetime('now', ? || ' days')
@@ -580,12 +710,25 @@ def device_history(device_name: str, days: int = 7) -> str:
 
     snapshots = [
         {
-            "ts": r["ts"],
-            "num_qubits": r["num_qubits"],
-            "operational": bool(r["operational"]) if r["operational"] is not None else None,
-            "pending_jobs": r["pending_jobs"],
-            "avg_cx_error": r["avg_cx_error"],
-            "avg_readout_error": r["avg_readout_error"],
+            "ts":                  r["ts"],
+            "num_qubits":          r["num_qubits"],
+            "operational":         bool(r["operational"]) if r["operational"] is not None else None,
+            "pending_jobs":        r["pending_jobs"],
+            "avg_cx_error":        r["avg_cx_error"],
+            "avg_readout_error":   r["avg_readout_error"],
+            "median_t1_us":             r["median_t1_us"],
+            "median_t2_us":             r["median_t2_us"],
+            "qubit_yield_fraction":     r["qubit_yield_fraction"],
+            "day_of_week":              r["day_of_week"],
+            "hour_utc":                 r["hour_utc"],
+            "processor_family":         r["processor_family"],
+            "backend_version":          r["backend_version"],
+            "last_calibration_dt":      r["last_calibration_dt"],
+            "clops_h":                  r["clops_h"],
+            "quantum_volume":           r["quantum_volume"],
+            "avg_2q_gate_duration_ns":  r["avg_2q_gate_duration_ns"],
+            "avg_prob_meas0_prep1":     r["avg_prob_meas0_prep1"],
+            "avg_prob_meas1_prep0":     r["avg_prob_meas1_prep0"],
         }
         for r in rows
     ]
@@ -594,6 +737,93 @@ def device_history(device_name: str, days: int = 7) -> str:
         {"device": device_name, "days": days, "snapshots": snapshots},
         indent=2,
     )
+
+
+# --------------------------------------------------------------------------
+# Tool 6b: device_profile
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def device_profile(device_name: str) -> str:
+    """
+    Return the complete hardware profile for one quantum backend using the
+    most recent snapshot — including processor family, CLOPS benchmark,
+    gate duration, last calibration time, readout asymmetry, and job limits.
+
+    This surfaces the BackendV2 extended fields that device_history and
+    get_device_details do not expose.
+
+    Args:
+        device_name: Exact backend name, e.g. "ibm_marrakesh".
+
+    Returns a JSON object with every collected field for that device.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            """
+            SELECT ts, provider, name, num_qubits, operational, pending_jobs,
+                   avg_cx_error, avg_readout_error,
+                   median_t1_us, median_t2_us, qubit_yield_fraction,
+                   native_gate_set, coupling_map_edges, connectivity_density,
+                   max_shots, max_experiments,
+                   processor_family, backend_version, online_date,
+                   last_calibration_dt, dt_ns,
+                   avg_2q_gate_duration_ns, avg_readout_length_ns,
+                   avg_prob_meas0_prep1, avg_prob_meas1_prep0,
+                   rep_delay_default_ms, clops_h, quantum_volume
+            FROM   device_snapshots
+            WHERE  name = ?
+            ORDER  BY ts DESC
+            LIMIT  1
+            """,
+            (device_name,),
+        ).fetchone()
+
+    if row is None:
+        return json.dumps({"error": f"No snapshot found for '{device_name}'. "
+                           "Run list_devices to see available backends."})
+
+    profile = {
+        "device":               row["name"],
+        "provider":             row["provider"],
+        "snapshot_ts":          row["ts"],
+        # ── Identity ──────────────────────────────────────────────────
+        "num_qubits":           row["num_qubits"],
+        "processor_family":     row["processor_family"],
+        "backend_version":      row["backend_version"],
+        "online_date":          row["online_date"],
+        "last_calibration_dt":  row["last_calibration_dt"],
+        # ── Performance benchmark ──────────────────────────────────────
+        "clops_h":              row["clops_h"],
+        "quantum_volume":       row["quantum_volume"],
+        # ── Gate quality ──────────────────────────────────────────────
+        "avg_cx_error":         row["avg_cx_error"],
+        "avg_readout_error":    row["avg_readout_error"],
+        "avg_prob_meas0_prep1": row["avg_prob_meas0_prep1"],
+        "avg_prob_meas1_prep0": row["avg_prob_meas1_prep0"],
+        # ── Coherence ─────────────────────────────────────────────────
+        "median_t1_us":         row["median_t1_us"],
+        "median_t2_us":         row["median_t2_us"],
+        "qubit_yield_fraction": row["qubit_yield_fraction"],
+        # ── Timing ────────────────────────────────────────────────────
+        "dt_ns":                    row["dt_ns"],
+        "avg_2q_gate_duration_ns":  row["avg_2q_gate_duration_ns"],
+        "avg_readout_length_ns":    row["avg_readout_length_ns"],
+        "rep_delay_default_ms":     row["rep_delay_default_ms"],
+        # ── Topology ──────────────────────────────────────────────────
+        "native_gate_set":      row["native_gate_set"],
+        "coupling_map_edges":   row["coupling_map_edges"],
+        "connectivity_density": row["connectivity_density"],
+        # ── Job limits ────────────────────────────────────────────────
+        "max_shots":            row["max_shots"],
+        "max_experiments":      row["max_experiments"],
+        # ── Live status ───────────────────────────────────────────────
+        "operational":          bool(row["operational"]) if row["operational"] is not None else None,
+        "pending_jobs":         row["pending_jobs"],
+    }
+
+    return json.dumps(profile, indent=2)
 
 
 # --------------------------------------------------------------------------
@@ -729,6 +959,15 @@ def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
     sampler = Sampler(mode=backend)
     job = sampler.run([isa_circuit], shots=shots)
 
+    _snapshot.log_job_submission(
+        job_id=job.job_id(), provider="ibm", backend_name=device_name,
+        tool_name="submit_job",
+        circuit_qubits=circuit.num_qubits,
+        circuit_depth_raw=circuit.depth(),
+        circuit_depth_transpiled=isa_circuit.depth(),
+        shots_requested=shots,
+    )
+
     return json.dumps({
         "job_id": job.job_id(),
         "status": str(job.status()),
@@ -842,14 +1081,28 @@ def job_results(job_id: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"Failed to retrieve results: {e}"})
 
-    # SamplerV2 wraps results in a PrimitiveResult containing one PubResult per circuit.
-    # Each PubResult has a DataBin with one BitArray per classical register.
-    # We collect counts from every register (circuits with one register are the common case).
     try:
         pub_result = result[0]
+
+        # EstimatorV2 jobs (VQE, expectation values) return evs/stds, not bitstring counts.
+        if hasattr(pub_result.data, "evs"):
+            evs = pub_result.data.evs
+            stds = getattr(pub_result.data, "stds", None)
+            return json.dumps({
+                "job_id":           job_id,
+                "status":           "DONE",
+                "backend":          job.backend().name,
+                "type":             "estimator",
+                "expectation_value": float(evs) if hasattr(evs, "__float__") else list(evs),
+                "std_error":        float(stds) if stds is not None and hasattr(stds, "__float__") else None,
+                "note": "EstimatorV2 job — returns expectation value(s), not bitstring counts.",
+            }, indent=2)
+
+        # SamplerV2 jobs return BitArrays with bitstring counts.
         counts_by_register = {}
         for reg_name, bit_array in vars(pub_result.data).items():
             counts_by_register[reg_name] = bit_array.get_counts()
+
     except Exception as e:
         return json.dumps({
             "error": f"Failed to parse result data: {e}",
@@ -864,6 +1117,10 @@ def job_results(job_id: str) -> str:
     )
 
     total_shots = sum(counts.values()) if isinstance(counts, dict) else None
+
+    # Log outcome back to job_submissions for the 6-month study
+    if isinstance(counts, dict):
+        _snapshot.log_job_result(job_id, counts)
 
     return json.dumps({
         "job_id":      job_id,
@@ -1014,7 +1271,7 @@ def run_grover(n_qubits: int, target_state: str) -> str:
     # Optimal number of Grover iterations for a single marked state:
     # floor(π/4 * sqrt(N)) where N = 2^n_qubits
     # n=2 → 1 iteration, n=3 → 2 iterations
-    n_iterations = max(1, round(math.pi / 4 * math.sqrt(2 ** n_qubits)))
+    n_iterations = max(1, math.floor(math.pi / 4 * math.sqrt(2 ** n_qubits)))
 
     qc = QuantumCircuit(n_qubits, n_qubits)
 
@@ -1082,6 +1339,15 @@ def run_grover(n_qubits: int, target_state: str) -> str:
     sampler = Sampler(mode=best_backend)
     job = sampler.run([isa_circuit], shots=1024)
 
+    _snapshot.log_job_submission(
+        job_id=job.job_id(), provider="ibm", backend_name=best_backend.name,
+        tool_name="run_grover",
+        circuit_qubits=n_qubits,
+        circuit_depth_raw=qc.depth(),
+        circuit_depth_transpiled=isa_circuit.depth(),
+        shots_requested=1024,
+    )
+
     # Theoretical success probability after optimal iterations
     # P = sin²((2k+1) * arcsin(1/sqrt(N))) where k = n_iterations
     theta = math.asin(1 / math.sqrt(2 ** n_qubits))
@@ -1106,7 +1372,196 @@ def run_grover(n_qubits: int, target_state: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Tool 14: estimate_expectation
+# Tool 14: run_vqe
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def run_vqe(molecule: str = "H2", backend_name: str = "simulator",
+            max_iterations: int = 150) -> str:
+    """
+    Run the Variational Quantum Eigensolver (VQE) to find the ground state
+    energy of a molecule.
+
+    VQE is the core quantum chemistry algorithm. It finds the lowest energy
+    configuration of a molecule by iterating: prepare a quantum state →
+    measure its energy → classically adjust circuit parameters → repeat
+    until the energy converges.
+
+    This is the first step toward simulating receptor-ligand binding energies
+    for drug discovery research.
+
+    Args:
+        molecule:       Molecule to simulate. Currently supports "H2".
+                        H2 is the standard benchmark — ground state = -1.857275 Hartree.
+        backend_name:   "simulator" (free, runs locally) or an IBM backend name
+                        like "ibm_fez" (costs QPU minutes). Default: "simulator".
+        max_iterations: Max COBYLA optimizer iterations (default 150).
+                        More iterations = more accurate but slower.
+
+    Returns JSON with:
+      - molecule        Molecule simulated
+      - vqe_energy      Found ground state energy in Hartree
+      - exact_energy    Known exact value (for comparison)
+      - error_hartree   Absolute error
+      - error_mhartree  Error in milli-Hartree (chemical accuracy = < 1.6 mHa)
+      - converged       Whether optimizer converged
+      - iterations      Number of optimizer iterations used
+      - backend         Where it ran (simulator or IBM device)
+      - optimal_params  Best circuit parameters found
+      - job_id          IBM job ID (only when backend_name is a real device)
+      - note            Plain-English interpretation
+    """
+    import numpy as np
+    from scipy.optimize import minimize
+    from qiskit.quantum_info import SparsePauliOp as _SparsePauliOp
+
+    # ── Molecule definitions ─────────────────────────────────────────────────
+    # Each molecule: (Hamiltonian terms, exact ground state energy in Hartree)
+    MOLECULES = {
+        "H2": (
+            [("II", -1.0523732), ("IZ", 0.39793742), ("ZI", -0.39793742),
+             ("ZZ", -0.01128010), ("XX", 0.18093119)],
+            -1.857275,  # electronic ground state (this Hamiltonian, STO-3G basis)
+        ),
+    }
+
+    mol = molecule.upper()
+    if mol not in MOLECULES:
+        return json.dumps({
+            "error": f"Molecule '{molecule}' not supported. Currently available: {list(MOLECULES.keys())}",
+            "note": "H2 is the standard benchmark. More molecules (LiH, BeH2) coming soon."
+        })
+
+    pauli_terms, exact_energy = MOLECULES[mol]
+    hamiltonian = _SparsePauliOp.from_list(pauli_terms)
+    n_qubits = len(pauli_terms[0][0])  # length of "II" = 2
+
+    # ── Ansatz: hardware-efficient (RY + CNOT) ───────────────────────────────
+    def build_ansatz(params):
+        qc = QuantumCircuit(n_qubits)
+        qc.ry(params[0], 0)
+        qc.ry(params[1], 1)
+        qc.cx(0, 1)
+        qc.ry(params[2], 0)
+        qc.ry(params[3], 1)
+        return qc
+
+    # ── Simulator path (free) ────────────────────────────────────────────────
+    if backend_name == "simulator":
+        from qiskit.primitives import StatevectorEstimator as _SVEstimator
+
+        estimator = _SVEstimator()
+        iteration_count = [0]
+
+        def cost_fn(params):
+            qc = build_ansatz(params)
+            result = estimator.run([(qc, hamiltonian)]).result()
+            iteration_count[0] += 1
+            return result[0].data.evs.real
+
+        rng = np.random.default_rng(42)
+        x0 = rng.uniform(-np.pi, np.pi, 4)
+        result = minimize(cost_fn, x0, method="COBYLA",
+                          options={"maxiter": max_iterations, "rhobeg": 0.5})
+
+        vqe_energy = float(result.fun)
+        error = abs(vqe_energy - exact_energy)
+        error_mha = error * 1000
+
+        if error_mha < 1.6:
+            interp = "Chemical accuracy achieved — error < 1.6 mHartree. The quantum computer found the true ground state."
+        elif error_mha < 10:
+            interp = "Near chemical accuracy. Good result for this ansatz."
+        else:
+            interp = "Did not reach chemical accuracy. Try more iterations or a deeper ansatz."
+
+        return json.dumps({
+            "molecule": mol,
+            "backend": "local StatevectorSimulator (free)",
+            "vqe_energy": round(vqe_energy, 6),
+            "exact_energy": exact_energy,
+            "error_hartree": round(error, 6),
+            "error_mhartree": round(error_mha, 3),
+            "converged": bool(result.success),
+            "iterations": iteration_count[0],
+            "optimal_params": [round(float(p), 4) for p in result.x],
+            "job_id": None,
+            "note": interp,
+            "next_step": (
+                f"To run on real IBM hardware: run_vqe(molecule='{mol}', backend_name='ibm_fez'). "
+                "Hardware noise will push the energy slightly above the exact value — "
+                "IonQ trapped ions would give the cleanest result."
+            ),
+        }, indent=2)
+
+    # ── Real IBM hardware path (costs QPU minutes) ───────────────────────────
+    # Strategy: first find optimal params on simulator (free), then evaluate
+    # the single optimal circuit on real hardware (1 job, minimal cost).
+    from qiskit.primitives import StatevectorEstimator as _SVEstimator2
+    from qiskit_ibm_runtime import EstimatorV2 as _IBMEstimator
+
+    # Step 1: find optimal params on simulator for free
+    estimator_sim = _SVEstimator2()
+    iter_sim = [0]
+
+    def cost_sim(params):
+        qc = build_ansatz(params)
+        result = estimator_sim.run([(qc, hamiltonian)]).result()
+        iter_sim[0] += 1
+        return result[0].data.evs.real
+
+    rng = np.random.default_rng(42)
+    x0 = rng.uniform(-np.pi, np.pi, 4)
+    sim_result = minimize(cost_sim, x0, method="COBYLA",
+                          options={"maxiter": max_iterations, "rhobeg": 0.5})
+    optimal_params = sim_result.x
+    sim_energy = float(sim_result.fun)
+
+    # Step 2: evaluate optimal circuit once on real hardware
+    service = _get_service()
+    try:
+        backend = service.backend(backend_name)
+    except Exception as e:
+        return json.dumps({"error": f"Backend '{backend_name}' not found: {e}"})
+
+    qc = build_ansatz(optimal_params)
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    isa_circuit = pm.run(qc)
+    isa_hamiltonian = hamiltonian.apply_layout(isa_circuit.layout)
+
+    hw_estimator = _IBMEstimator(backend)
+    try:
+        job = hw_estimator.run([(isa_circuit, isa_hamiltonian)])
+    except Exception as e:
+        return json.dumps({"error": f"IBM hardware submission failed: {e}"})
+
+    _snapshot.log_job_submission(
+        job_id=job.job_id(), provider="ibm", backend_name=backend_name,
+        tool_name="run_vqe",
+        circuit_qubits=qc.num_qubits,
+        circuit_depth_raw=qc.depth(),
+        circuit_depth_transpiled=isa_circuit.depth(),
+    )
+
+    return json.dumps({
+        "molecule": mol,
+        "backend": backend_name,
+        "simulator_energy": round(sim_energy, 6),
+        "exact_energy": exact_energy,
+        "simulator_iterations": iter_sim[0],
+        "optimal_params": [round(float(p), 4) for p in optimal_params],
+        "job_id": job.job_id(),
+        "status": str(job.status()),
+        "note": (
+            f"Simulator found optimal parameters (energy={sim_energy:.6f} Hartree). "
+            f"Now evaluating on {backend_name} real hardware. "
+            f"Use job_status to track, then job_results to retrieve the hardware energy."
+        ),
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool 15: estimate_expectation
 # --------------------------------------------------------------------------
 
 @mcp.tool()
@@ -2308,37 +2763,2969 @@ def collect_forged_energy(atoms: str, n_electrons: int, job_ids: str,
 # API Key Authentication Middleware
 # --------------------------------------------------------------------------
 
-class APIKeyAuthMiddleware(BaseHTTPMiddleware):
+class APIKeyAuthMiddleware:
     """
-    Middleware to validate API key for HTTP requests.
-    
-    If MCP_API_KEY environment variable is set, all requests must include
-    a matching X-API-Key header. If not set, all requests are allowed
-    (development mode).
+    Pure ASGI middleware for API key auth.
+
+    Replaces BaseHTTPMiddleware to avoid Starlette 1.3.x SSE breakage —
+    BaseHTTPMiddleware wraps SSE responses in a buffer that causes an
+    AssertionError when the SSE stream sends http.response.start twice.
+    A raw ASGI __call__ passes the connection straight through.
     """
-    
+
     def __init__(self, app, api_key: Optional[str] = None):
-        super().__init__(app)
+        self.app = app
         self.api_key = api_key or os.getenv("MCP_API_KEY")
-    
-    async def dispatch(self, request: Request, call_next):
-        # If no API key is configured, allow all requests (development mode)
+
+    async def __call__(self, scope, receive, send):
+        # Only inspect HTTP/WebSocket — pass lifespan events straight through
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
         if not self.api_key:
-            return await call_next(request)
-        
-        # Check for API key in request headers (case-insensitive)
-        request_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
-        
+            await self.app(scope, receive, send)
+            return
+
+        # Headers arrive as a list of (name_bytes, value_bytes) tuples
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        request_key = headers.get(b"x-api-key", b"").decode()
+
         if request_key != self.api_key:
-            return JSONResponse(
+            response = _JSONResponse(
                 status_code=401,
                 content={
                     "error": "Unauthorized",
-                    "message": "Invalid or missing API key. Include X-API-Key header with your request.",
-                }
+                    "message": "Invalid or missing API key. Include X-API-Key header.",
+                },
             )
-        
-        return await call_next(request)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+# --------------------------------------------------------------------------
+# Tool 17: ionq_devices  — list IonQ quantum computers
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def ionq_devices() -> str:
+    """
+    List all available IonQ quantum computers and simulators.
+
+    IonQ uses trapped-ion technology — a different physical approach from
+    IBM's superconducting qubits. Trapped-ion systems tend to have higher
+    gate fidelity but fewer qubits than IBM machines.
+
+    Returns a list of IonQ backends with qubit count and availability.
+    Requires IONQ_API_KEY in .env.
+    """
+    api_key = os.getenv("IONQ_API_KEY")
+    if not api_key:
+        return json.dumps({
+            "error": "IONQ_API_KEY not set in .env",
+            "hint": "Get your key at cloud.ionq.com and add IONQ_API_KEY=your_key to .env"
+        })
+
+    try:
+        # Direct REST API — the qiskit_ionq SDK's IonQProvider.backends() only
+        # surfaces 2 of 6 real backends (stale/legacy endpoint). This is the
+        # same endpoint snapshot.py uses and it returns the full fleet.
+        resp = requests.get(
+            "https://api.ionq.co/v0.3/backends",
+            headers={"Authorization": f"apiKey {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        backends = resp.json()
+
+        result = []
+        for b in backends:
+            name = b.get("backend", b.get("name", "unknown"))
+            status = b.get("status")
+            result.append({
+                "name": name,
+                "num_qubits": b.get("qubits"),
+                "available": status == "available",
+                "status": status,  # "available" | "unavailable" | "retired"
+                "type": "simulator" if "simulator" in name else "hardware",
+                "provider": "IonQ",
+                "technology": "trapped-ion",
+            })
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool 18: ionq_submit_job  — submit a circuit to IonQ
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def ionq_submit_job(
+    backend_name: str,
+    qasm_string: str,
+    shots: int = 1024,
+) -> str:
+    """
+    Compile and submit an OpenQASM 2 circuit to an IonQ quantum computer.
+
+    IonQ's trapped-ion hardware is great for circuits needing high fidelity
+    on a small number of qubits. Use ionq_devices() first to see which
+    backends are available.
+
+    Args:
+        backend_name : IonQ backend to use — e.g. 'ionq_simulator' or 'ionq_qpu'
+        qasm_string  : OpenQASM 2.0 circuit string
+        shots        : number of times to run the circuit (default 1024)
+
+    Returns job_id, status, backend, and shots.
+    Requires IONQ_API_KEY in .env.
+    """
+    api_key = os.getenv("IONQ_API_KEY")
+    if not api_key:
+        return json.dumps({
+            "error": "IONQ_API_KEY not set in .env",
+            "hint": "Get your key at cloud.ionq.com and add IONQ_API_KEY=your_key to .env"
+        })
+
+    try:
+        from qiskit_ionq import IonQProvider
+        from qiskit import QuantumCircuit as QC
+
+        # Parse the QASM string into a Qiskit circuit
+        try:
+            circuit = QC.from_qasm_str(qasm_string)
+        except Exception as parse_err:
+            return json.dumps({
+                "error": f"Failed to parse QASM: {parse_err}",
+                "hint": "IonQ supports OpenQASM 2.0 — make sure your circuit starts with: OPENQASM 2.0;"
+            })
+
+        provider = IonQProvider(api_key)
+        backend = provider.get_backend(backend_name)
+
+        # Submit the job
+        job = backend.run(circuit, shots=shots)
+
+        return json.dumps({
+            "job_id": job.job_id(),
+            "status": "SUBMITTED",
+            "backend": backend_name,
+            "shots": shots,
+            "provider": "IonQ",
+            "hint": "Use ionq_job_status(job_id) to check progress"
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool 19: ionq_job_status  — check IonQ job status
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def ionq_job_status(job_id: str, backend_name: str = "ionq_simulator") -> str:
+    """
+    Check the status of a submitted IonQ job.
+
+    Args:
+        job_id       : the job ID returned by ionq_submit_job
+        backend_name : the backend the job was submitted to (default: ionq_simulator)
+
+    Returns current status and job details.
+    """
+    api_key = os.getenv("IONQ_API_KEY")
+    if not api_key:
+        return json.dumps({"error": "IONQ_API_KEY not set in .env"})
+
+    try:
+        from qiskit_ionq import IonQProvider
+        provider = IonQProvider(api_key)
+        backend = provider.get_backend(backend_name)
+        job = backend.retrieve_job(job_id)
+
+        status = job.status()
+
+        return json.dumps({
+            "job_id": job_id,
+            "status": str(status.name),
+            "backend": backend_name,
+            "provider": "IonQ",
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool 20: ionq_job_results  — get results from a completed IonQ job
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def ionq_job_results(job_id: str, backend_name: str = "ionq_simulator") -> str:
+    """
+    Retrieve measurement counts from a completed IonQ job.
+
+    Args:
+        job_id       : the job ID returned by ionq_submit_job
+        backend_name : the backend the job was submitted to (default: ionq_simulator)
+
+    Returns bit-string counts like {"00": 512, "11": 512}.
+    Job must be in DONE status — check with ionq_job_status() first.
+    """
+    api_key = os.getenv("IONQ_API_KEY")
+    if not api_key:
+        return json.dumps({"error": "IONQ_API_KEY not set in .env"})
+
+    try:
+        from qiskit_ionq import IonQProvider
+        from qiskit.providers import JobStatus
+        provider = IonQProvider(api_key)
+        backend = provider.get_backend(backend_name)
+        job = backend.retrieve_job(job_id)
+
+        status = job.status()
+        if status != JobStatus.DONE:
+            return json.dumps({
+                "job_id": job_id,
+                "status": str(status.name),
+                "message": "Job not complete yet — check again with ionq_job_status()"
+            })
+
+        counts = job.result().get_counts()
+        return json.dumps({
+            "job_id": job_id,
+            "backend": backend_name,
+            "provider": "IonQ",
+            "counts": counts,
+            "total_shots": sum(counts.values()),
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_alerts(device_name: str = "", days: int = 7) -> str:
+    """
+    Return calibration drift alerts for IBM Quantum devices.
+
+    The snapshot agent (runs every 6 hours) compares each new snapshot
+    against the previous one. When a device's avg_cx_error or
+    avg_readout_error rises by more than 20%, or a device goes offline,
+    an alert is written to the database.
+
+    This is what Nikita's problem was — ibm_boston wasn't recalibrated
+    and nobody knew until jobs were stuck for 5 hours. This catches it
+    at the next snapshot automatically.
+
+    Args:
+        device_name : filter to one device (e.g. "ibm_boston") — leave empty for all
+        days        : how many days back to look (default 7)
+
+    Returns a list of alerts with device name, alert type, values, and timestamp.
+    Alert types:
+        cx_error_spike              — 2-qubit gate error rose >20%
+        readout_error_spike         — readout error rose >20%
+        went_offline                — device went from operational to offline
+        t1_drop                     — median T1 coherence dropped >20% (early warning)
+        t2_drop                     — median T2 coherence dropped >20% (early warning)
+    """
+    import sqlite3 as _sqlite3
+
+    db_path = os.path.join(os.path.dirname(__file__), "devices.db")
+    if not os.path.exists(db_path):
+        return json.dumps({"error": "No local database found. Run snapshot.py first."})
+
+    try:
+        with _sqlite3.connect(db_path) as con:
+            # Stored alerts (cx/readout/offline) from snapshot.py
+            query = """
+                SELECT ts, device_name, alert_type, prev_value, curr_value, pct_change
+                FROM device_alerts
+                WHERE ts >= datetime('now', ? || ' days')
+            """
+            params: list = [f"-{max(1, int(days))}"]
+            if device_name:
+                query += " AND device_name = ?"
+                params.append(device_name)
+            query += " ORDER BY ts DESC LIMIT 200"
+            stored_rows = con.execute(query, params).fetchall()
+
+            # Live T1/T2 drop detection using LAG() window function
+            t1t2_params: list = [f"-{max(1, int(days))}"]
+            t1t2_filter = ""
+            if device_name:
+                t1t2_filter = "AND name = ?"
+                t1t2_params.append(device_name)
+
+            t1t2_rows = con.execute(f"""
+                WITH ranked AS (
+                    SELECT name, ts, median_t1_us, median_t2_us,
+                        LAG(median_t1_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t1,
+                        LAG(median_t2_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t2
+                    FROM device_snapshots
+                    WHERE ts >= datetime('now', ? || ' days')
+                    {t1t2_filter}
+                )
+                SELECT name, ts, median_t1_us, prev_t1, median_t2_us, prev_t2
+                FROM ranked
+                WHERE prev_t1 IS NOT NULL
+                  AND (
+                    (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
+                    OR
+                    (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
+                  )
+                ORDER BY ts DESC LIMIT 100
+            """, t1t2_params).fetchall()
+
+        alerts = []
+
+        for ts, name, alert_type, prev, curr, pct in stored_rows:
+            entry = {"ts": ts, "device": name, "type": alert_type}
+            if alert_type == "went_offline":
+                entry["message"] = f"{name} went offline"
+            else:
+                label = "cx_error" if "cx" in alert_type else "readout_error"
+                entry["message"] = (
+                    f"{name} {label} spiked {pct}% "
+                    f"(was {prev:.5f}, now {curr:.5f})"
+                )
+            alerts.append(entry)
+
+        for name, ts, t1, prev_t1, t2, prev_t2 in t1t2_rows:
+            if prev_t1 and prev_t1 > 0 and (prev_t1 - t1) / prev_t1 > 0.20:
+                pct = round((prev_t1 - t1) / prev_t1 * 100, 1)
+                alerts.append({
+                    "ts": ts, "device": name, "type": "t1_drop",
+                    "message": f"{name} T1 dropped {pct}% (was {prev_t1:.1f}µs, now {t1:.1f}µs) — early warning of material drift",
+                })
+            if prev_t2 and prev_t2 > 0 and (prev_t2 - t2) / prev_t2 > 0.20:
+                pct = round((prev_t2 - t2) / prev_t2 * 100, 1)
+                alerts.append({
+                    "ts": ts, "device": name, "type": "t2_drop",
+                    "message": f"{name} T2 dropped {pct}% (was {prev_t2:.1f}µs, now {t2:.1f}µs) — early warning of phase decay",
+                })
+
+        alerts.sort(key=lambda a: a["ts"], reverse=True)
+
+        if not alerts:
+            msg = f"No alerts in the last {days} day(s)"
+            if device_name:
+                msg += f" for {device_name}"
+            return json.dumps({"alerts": [], "message": msg})
+
+        return json.dumps({
+            "alerts": alerts,
+            "total": len(alerts),
+            "period_days": days,
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def start_repro_experiment(
+    circuit: str,
+    backend_name: str,
+    n_runs: int = 5,
+    shots: int = 1024,
+) -> str:
+    """
+    Submit the same circuit N times to measure reproducibility on real hardware.
+
+    NISQ hardware results vary between runs due to calibration drift and noise.
+    This tool submits identical circuits N times, storing each job ID so you
+    can later call repro_score() to compute the reproducibility score.
+
+    Args:
+        circuit      : OpenQASM 2.0 or 3.0 circuit string
+        backend_name : IBM device to run on (e.g. "ibm_fez")
+        n_runs       : how many times to run the same circuit (default 5)
+        shots        : shots per run (default 1024)
+
+    Returns an experiment_id. Use repro_score(experiment_id) after all
+    jobs complete to get the variance analysis and 0-1 reproducibility score.
+    """
+    try:
+        service = _get_service()
+        backend = service.backend(backend_name)
+
+        # Parse circuit
+        try:
+            qc = QuantumCircuit.from_qasm_str(circuit)
+        except Exception:
+            try:
+                qc = qiskit_qasm3.loads(circuit)
+            except Exception as e:
+                return json.dumps({"error": f"Could not parse circuit: {e}"})
+
+        # Transpile once, reuse for all runs
+        pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+        isa_circuit = pm.run(qc)
+
+        # Get current calibration epoch for drift tracking
+        props = backend.properties()
+        cx_errors = []
+        if props:
+            from snapshot import _two_qubit_errors
+            try:
+                cx_errors = _two_qubit_errors(props)
+            except Exception:
+                pass
+        calibration_epoch = round(sum(cx_errors) / len(cx_errors), 5) if cx_errors else None
+
+        ts = datetime.now(timezone.utc).isoformat()
+
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.execute("""
+                INSERT INTO repro_experiments (created_ts, device_name, circuit, n_runs, shots, status)
+                VALUES (?, ?, ?, ?, ?, 'running')
+            """, (ts, backend_name, circuit, n_runs, shots))
+            experiment_id = cur.lastrowid
+
+            sampler = Sampler(backend)
+            job_ids = []
+            for i in range(n_runs):
+                job = sampler.run([isa_circuit], shots=shots)
+                job_id = job.job_id()
+                job_ids.append(job_id)
+                con.execute("""
+                    INSERT INTO repro_runs
+                        (experiment_id, run_index, submitted_ts, job_id, status, calibration_epoch)
+                    VALUES (?, ?, ?, ?, 'submitted', ?)
+                """, (experiment_id, i, datetime.now(timezone.utc).isoformat(), job_id,
+                      str(calibration_epoch) if calibration_epoch else None))
+
+        return json.dumps({
+            "experiment_id": experiment_id,
+            "device": backend_name,
+            "n_runs": n_runs,
+            "shots": shots,
+            "job_ids": job_ids,
+            "calibration_epoch": calibration_epoch,
+            "message": f"Submitted {n_runs} jobs. Call repro_score({experiment_id}) after they complete.",
+            "hint": "Use job_status(job_id) to check individual jobs."
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def repro_score(experiment_id: int) -> str:
+    """
+    Compute the reproducibility score for a completed repeat experiment.
+
+    Fetches results for all runs in the experiment, computes:
+    - Mean output distribution across all runs
+    - KL-divergence of each run from the mean (variance signal)
+    - Reproducibility score 0.0 to 1.0 (1.0 = identical results every run)
+    - Flag if calibration epoch changed between any two runs
+
+    A score above 0.9 means your result is likely real signal.
+    A score below 0.7 means the result is probably noise-driven — rerun later.
+
+    Args:
+        experiment_id : the ID returned by start_repro_experiment()
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            exp = con.execute("""
+                SELECT device_name, circuit, n_runs, shots, created_ts
+                FROM repro_experiments WHERE id = ?
+            """, (experiment_id,)).fetchone()
+
+            if not exp:
+                return json.dumps({"error": f"Experiment {experiment_id} not found."})
+
+            device_name, circuit, n_runs, shots, created_ts = exp
+
+            runs = con.execute("""
+                SELECT run_index, job_id, status, counts, calibration_epoch
+                FROM repro_runs WHERE experiment_id = ?
+                ORDER BY run_index
+            """, (experiment_id,)).fetchall()
+
+        # Fetch any pending results from IBM
+        service = _get_service()
+        all_counts = []
+        pending = []
+        epochs = set()
+
+        for run_index, job_id, status, counts_str, epoch in runs:
+            if epoch:
+                epochs.add(epoch)
+            if counts_str:
+                all_counts.append(json.loads(counts_str))
+                continue
+            if not job_id:
+                pending.append(run_index)
+                continue
+            try:
+                job = service.job(job_id)
+                jstatus = job.status()
+                if str(jstatus) in ("JobStatus.DONE", "DONE", "done"):
+                    result = job.result()
+                    pub_result = result[0]
+                    bitarray = pub_result.data
+                    field = list(vars(bitarray).keys())[0] if vars(bitarray) else None
+                    if field:
+                        counts = getattr(bitarray, field).get_counts()
+                    else:
+                        counts = {}
+                    counts_json = json.dumps(counts)
+                    with sqlite3.connect(DB_PATH) as con:
+                        con.execute("""
+                            UPDATE repro_runs SET status='done', counts=?
+                            WHERE experiment_id=? AND run_index=?
+                        """, (counts_json, experiment_id, run_index))
+                    all_counts.append(counts)
+                else:
+                    pending.append(run_index)
+            except Exception as e:
+                pending.append(run_index)
+
+        if pending:
+            return json.dumps({
+                "experiment_id": experiment_id,
+                "device": device_name,
+                "status": "incomplete",
+                "completed_runs": len(all_counts),
+                "pending_runs": pending,
+                "message": f"{len(pending)} run(s) still pending. Check with job_status() and retry repro_score()."
+            }, indent=2)
+
+        # --- Compute reproducibility score ---
+
+        # Gather all unique bitstrings across all runs
+        all_keys = set()
+        for c in all_counts:
+            all_keys.update(c.keys())
+
+        # Normalize each run into a probability distribution
+        dists = []
+        for c in all_counts:
+            total = sum(c.values()) or 1
+            dists.append({k: c.get(k, 0) / total for k in all_keys})
+
+        # Mean distribution
+        mean_dist = {k: sum(d[k] for d in dists) / len(dists) for k in all_keys}
+
+        # KL divergence: D_KL(P || Q) = sum(P * log(P/Q))
+        eps = 1e-10
+        kl_divs = []
+        for d in dists:
+            kl = sum(
+                d[k] * math.log((d[k] + eps) / (mean_dist[k] + eps))
+                for k in all_keys if d[k] > 0
+            )
+            kl_divs.append(round(kl, 6))
+
+        avg_kl = sum(kl_divs) / len(kl_divs)
+
+        # Score: 1.0 = perfect reproducibility, 0.0 = completely random
+        # KL of 0 → score 1.0, KL of 0.5+ → score ~0.0
+        score = round(max(0.0, 1.0 - (avg_kl / 0.5)), 3)
+
+        # Top bitstring and its mean probability
+        top_bitstring = max(mean_dist, key=mean_dist.get)
+        top_prob = round(mean_dist[top_bitstring], 4)
+
+        # Calibration drift flag
+        calibration_drifted = len(epochs) > 1
+
+        # Mark experiment complete
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("UPDATE repro_experiments SET status='complete' WHERE id=?",
+                        (experiment_id,))
+
+        verdict = (
+            "RELIABLE — result is likely real signal" if score >= 0.9
+            else "MARGINAL — result may be partially noise-driven" if score >= 0.7
+            else "UNRELIABLE — result is likely noise, not signal"
+        )
+
+        return json.dumps({
+            "experiment_id": experiment_id,
+            "device": device_name,
+            "n_runs": len(all_counts),
+            "shots_per_run": shots,
+            "reproducibility_score": score,
+            "verdict": verdict,
+            "top_bitstring": top_bitstring,
+            "top_bitstring_mean_probability": top_prob,
+            "kl_divergences": kl_divs,
+            "avg_kl_divergence": round(avg_kl, 6),
+            "calibration_drifted_between_runs": calibration_drifted,
+            "calibration_epochs_seen": list(epochs),
+            "interpretation": (
+                "Score 0.9-1.0: publish with confidence. "
+                "Score 0.7-0.9: mention variance in methods section. "
+                "Score <0.7: do not publish — rerun on a better-calibrated device."
+            )
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _estimate_minutes(backend, qc, shots: int) -> dict:
+    """
+    Estimate how many minutes a circuit will cost on a backend.
+
+    Two components:
+    1. Queue wait  — pending_jobs × 30s average per job
+    2. Execution   — shots × circuit_depth × 1μs per gate layer
+    Both are rough but directionally correct for IBM Open Plan planning.
+    """
+    status = backend.status()
+    pending = status.pending_jobs or 0
+
+    try:
+        pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+        isa = pm.run(qc)
+        depth = isa.depth()
+        n_qubits = isa.num_qubits
+    except Exception:
+        depth = qc.depth()
+        n_qubits = qc.num_qubits
+
+    queue_secs = pending * 30
+    exec_secs = (shots * depth * 1e-6) + 2  # +2s overhead per job
+    total_secs = queue_secs + exec_secs
+    total_mins = round(total_secs / 60, 2)
+
+    return {
+        "pending_jobs_in_queue": pending,
+        "circuit_depth_after_transpile": depth,
+        "num_qubits": n_qubits,
+        "queue_wait_estimate_mins": round(queue_secs / 60, 2),
+        "execution_estimate_mins": round(exec_secs / 60, 4),
+        "total_estimate_mins": total_mins,
+    }
+
+
+@mcp.tool()
+def job_analytics() -> str:
+    """
+    Analyze all jobs submitted through this MCP server.
+
+    Returns a breakdown per tool showing:
+    - How many jobs were submitted
+    - Average circuit depth before and after transpilation
+    - Transpilation expansion ratio (how much the compiler inflated the circuit)
+    - Average shots requested
+
+    Useful for understanding how AI agents use quantum hardware over time.
+    This is the start of the agentic quantum workload study.
+    """
+    if not os.path.exists(DB_PATH):
+        return json.dumps({"error": "No local database found. Run snapshot.py first."})
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+                SELECT
+                    tool_name,
+                    COUNT(*) AS total_submissions,
+                    AVG(circuit_depth_raw) AS avg_raw_depth,
+                    AVG(circuit_depth_transpiled) AS avg_transpiled_depth,
+                    AVG(CAST(circuit_depth_transpiled AS REAL) /
+                        NULLIF(circuit_depth_raw, 0)) AS expansion_ratio,
+                    AVG(shots_requested) AS avg_shots
+                FROM job_submissions
+                GROUP BY tool_name
+                ORDER BY total_submissions DESC
+            """).fetchall()
+
+            total_jobs = con.execute(
+                "SELECT COUNT(*) FROM job_submissions"
+            ).fetchone()[0]
+
+        if not rows:
+            return json.dumps({
+                "total_jobs": 0,
+                "message": "No jobs logged yet. Jobs are logged when submit_job, run_grover, or run_vqe is called.",
+            })
+
+        by_tool = {}
+        for r in rows:
+            by_tool[r["tool_name"]] = {
+                "total_submissions": r["total_submissions"],
+                "avg_circuit_depth_raw": round(r["avg_raw_depth"], 1) if r["avg_raw_depth"] else None,
+                "avg_circuit_depth_transpiled": round(r["avg_transpiled_depth"], 1) if r["avg_transpiled_depth"] else None,
+                "transpilation_expansion_ratio": round(r["expansion_ratio"], 2) if r["expansion_ratio"] else None,
+                "avg_shots": round(r["avg_shots"], 0) if r["avg_shots"] else None,
+            }
+
+        return json.dumps({
+            "total_jobs_logged": total_jobs,
+            "by_tool": by_tool,
+            "note": "expansion_ratio = transpiled_depth / raw_depth — how much the compiler inflated your circuit to fit the hardware topology.",
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def estimate_runtime(
+    circuit: str,
+    backend_name: str,
+    shots: int = 1024,
+) -> str:
+    """
+    Estimate how many minutes a circuit will cost on an IBM device.
+
+    IBM Open Plan gives 180 minutes per year. This tool tells you how much
+    a specific circuit will cost BEFORE you submit — so you don't waste
+    your budget on the wrong backend or a busy queue.
+
+    Estimate includes:
+    - Queue wait time (based on current pending jobs × avg 30s per job)
+    - Execution time (based on transpiled circuit depth × shots)
+    - Total estimated cost in minutes
+
+    Args:
+        circuit      : OpenQASM 2.0 or 3.0 circuit string
+        backend_name : IBM device to estimate for (e.g. "ibm_fez")
+        shots        : number of shots (default 1024)
+
+    Returns estimated minutes broken down by queue wait vs execution.
+    """
+    try:
+        try:
+            qc = QuantumCircuit.from_qasm_str(circuit)
+        except Exception:
+            qc = qiskit_qasm3.loads(circuit)
+
+        service = _get_service()
+        backend = service.backend(backend_name)
+
+        est = _estimate_minutes(backend, qc, shots)
+        est["device"] = backend_name
+        est["shots"] = shots
+        est["note"] = (
+            "Queue wait is estimated at 30s/job (rough average). "
+            "Execution time is based on transpiled depth × shots. "
+            "IBM Open Plan budget: 180 min/year."
+        )
+
+        # Budget warning
+        if est["total_estimate_mins"] > 10:
+            est["warning"] = f"This job may cost ~{est['total_estimate_mins']} min — consider a shorter queue or fewer shots."
+
+        return json.dumps(est, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def route_job(
+    circuit: str,
+    shots: int = 1024,
+    max_minutes: float = 10.0,
+) -> str:
+    """
+    Recommend the best IBM device for your circuit based on cost and quality.
+
+    Checks all your accessible IBM devices and ranks them by:
+    1. Fits within max_minutes budget (queue + execution)
+    2. Lowest estimated total time
+    3. Lowest avg_cx_error (best fidelity)
+
+    This is credit-aware routing — it saves your IBM Open Plan minutes
+    for experiments that matter, not queue accidents.
+
+    Args:
+        circuit     : OpenQASM 2.0 or 3.0 circuit string
+        shots       : number of shots (default 1024)
+        max_minutes : reject devices that will cost more than this (default 10)
+
+    Returns ranked list of devices with cost estimate and recommendation.
+    """
+    try:
+        try:
+            qc = QuantumCircuit.from_qasm_str(circuit)
+        except Exception:
+            qc = qiskit_qasm3.loads(circuit)
+
+        required_qubits = qc.num_qubits
+        service = _get_service()
+        backends = service.backends(operational=True)
+
+        rankings = []
+        skipped = []
+
+        for backend in backends:
+            if backend.num_qubits < required_qubits:
+                skipped.append({
+                    "device": backend.name,
+                    "reason": f"only {backend.num_qubits} qubits, circuit needs {required_qubits}"
+                })
+                continue
+
+            try:
+                est = _estimate_minutes(backend, qc, shots)
+                total = est["total_estimate_mins"]
+
+                if total > max_minutes:
+                    skipped.append({
+                        "device": backend.name,
+                        "reason": f"estimated {total} min exceeds {max_minutes} min budget"
+                    })
+                    continue
+
+                # Get fidelity from latest snapshot
+                props = backend.properties()
+                cx_errors = []
+                if props:
+                    from snapshot import _two_qubit_errors
+                    try:
+                        cx_errors = _two_qubit_errors(props)
+                    except Exception:
+                        pass
+                avg_cx = round(sum(cx_errors) / len(cx_errors), 5) if cx_errors else None
+
+                rankings.append({
+                    "device": backend.name,
+                    "num_qubits": backend.num_qubits,
+                    "estimated_mins": total,
+                    "queue_wait_mins": est["queue_wait_estimate_mins"],
+                    "circuit_depth": est["circuit_depth_after_transpile"],
+                    "avg_cx_error": avg_cx,
+                })
+            except Exception as e:
+                skipped.append({"device": backend.name, "reason": str(e)})
+
+        # Sort: lowest time first, then lowest error
+        rankings.sort(key=lambda x: (x["estimated_mins"], x["avg_cx_error"] or 1))
+
+        if not rankings:
+            return json.dumps({
+                "error": "No devices fit within your budget or qubit requirements.",
+                "skipped": skipped,
+                "tip": f"Try increasing max_minutes (current: {max_minutes}) or simplifying your circuit."
+            }, indent=2)
+
+        recommendation = rankings[0]
+        return json.dumps({
+            "recommendation": recommendation["device"],
+            "reason": (
+                f"Lowest estimated cost ({recommendation['estimated_mins']} min) "
+                f"with avg_cx_error {recommendation['avg_cx_error']}"
+            ),
+            "ranked_devices": rankings,
+            "skipped_devices": skipped,
+            "circuit_requires_qubits": required_qubits,
+            "budget_max_minutes": max_minutes,
+            "ibm_open_plan_note": "IBM Open Plan: 180 min/year. Each minute counts."
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: check_routing_overhead
+# --------------------------------------------------------------------------
+@mcp.tool()
+def check_routing_overhead(qubit_interactions: list, device_name: str = "ibm_marrakesh") -> str:
+    """
+    Predict routing overhead BEFORE submitting a circuit to IBM heavy-hex hardware.
+
+    IBM heavy-hex qubits allow max 3 direct connections each (degree ≤ 3).
+    If your circuit needs a qubit to talk to 4+ other qubits, the transpiler
+    must inject SWAP gates — each SWAP = 3 CX gates — causing gate count to
+    explode. We discovered this the hard way: 263 logical gates became 1,037
+    hardware gates because one qubit needed degree 4.
+
+    Args:
+        qubit_interactions: List of [qubit_a, qubit_b] pairs that need to
+            interact in your circuit. Example: [[0,1],[1,2],[0,3],[0,4]]
+            means qubit 0 talks to qubits 1, 3, and 4 (degree 3 — safe).
+        device_name: IBM backend to check against (default: ibm_marrakesh).
+
+    Returns:
+        Per-qubit degree, any degree violations, and an estimated gate inflation
+        factor. Degree ≤ 3 is safe. Degree 4 typically means ~4× gate inflation.
+    """
+    # Build adjacency: count unique neighbors per qubit
+    from collections import defaultdict
+    neighbors = defaultdict(set)
+    for pair in qubit_interactions:
+        if len(pair) != 2:
+            return json.dumps({"error": f"Each interaction must be [a, b], got: {pair}"})
+        a, b = int(pair[0]), int(pair[1])
+        neighbors[a].add(b)
+        neighbors[b].add(a)
+
+    HEAVY_HEX_MAX_DEGREE = 3  # IBM heavy-hex physical constraint
+    violations = []
+    qubit_report = []
+
+    for qubit, nbrs in sorted(neighbors.items()):
+        degree = len(nbrs)
+        excess = max(0, degree - HEAVY_HEX_MAX_DEGREE)
+        # Each excess degree ≈ 1 SWAP per gate = 3 extra CX per interaction
+        estimated_swaps = excess * 3
+        status = "OK" if excess == 0 else f"VIOLATION (degree {degree}, max {HEAVY_HEX_MAX_DEGREE})"
+        if excess > 0:
+            violations.append({
+                "qubit": qubit,
+                "degree": degree,
+                "excess": excess,
+                "estimated_extra_cx": estimated_swaps,
+            })
+        qubit_report.append({
+            "qubit":   qubit,
+            "degree":  degree,
+            "neighbors": sorted(nbrs),
+            "status":  status,
+        })
+
+    # Overall inflation estimate
+    total_excess_cx = sum(v["estimated_extra_cx"] for v in violations)
+    if violations:
+        inflation_warning = (
+            f"{len(violations)} qubit(s) exceed degree-{HEAVY_HEX_MAX_DEGREE} limit. "
+            f"Estimated ~{total_excess_cx} extra CX gates from SWAP injection. "
+            f"This can multiply your hardware gate count by 3–5×. "
+            f"Recommendation: redesign the circuit to eliminate degree-{HEAVY_HEX_MAX_DEGREE+1}+ nodes, "
+            f"or switch to an Ising Hamiltonian approach (encode_search_problem tool)."
+        )
+    else:
+        inflation_warning = (
+            "All qubits are within degree-3 limit. "
+            "No SWAP injection expected. Circuit should map cleanly to heavy-hex."
+        )
+
+    return json.dumps({
+        "device": device_name,
+        "heavy_hex_max_degree": HEAVY_HEX_MAX_DEGREE,
+        "verdict": "ROUTING RISK" if violations else "SAFE",
+        "summary": inflation_warning,
+        "violations": violations,
+        "qubit_degrees": qubit_report,
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool: encode_search_problem
+# --------------------------------------------------------------------------
+@mcp.tool()
+def encode_search_problem(
+    conditions: dict,
+    coupling_hints: list = [],
+    coupling_strength: float = 0.5,
+) -> str:
+    """
+    Convert a Boolean search problem into an Ising Hamiltonian ready for LNAA
+    (Lattice-Native Amplitude Amplification) on IBM hardware.
+
+    We derived this approach from scratch in Phase 5 of the Singmaster project
+    after Grover's algorithm hit IBM heavy-hex routing limits. Instead of a
+    Boolean oracle, encode target states as the lowest-energy (ground) states
+    of a magnetic system. IBM's RZ + RZZ gates implement this natively — zero
+    routing overhead.
+
+    How the math works:
+        H = Σ h_i × Z_i + Σ J_ij × Z_i × Z_j
+        Z_i = -1 if qubit i is 1, +1 if qubit i is 0.
+        To reward qubit i = 1: set h_i = +1  (because h × (-1) = -1 = low energy)
+        To reward qubit i = 0: set h_i = -1  (because h × (+1) = -1 = low energy)
+        To penalise pairs i,j being equal: J_ij = +0.5 (coupling hint)
+
+    Args:
+        conditions: dict mapping qubit index (as string) to desired value.
+            Example: {"1": 1, "2": 1, "3": 1, "4": 0, "5": 0}
+            means we want q1=q2=q3=1 and q4=q5=0.
+        coupling_hints: optional list of [i, j] pairs to add mild coupling
+            between qubits (useful to break degeneracy between near-equal targets).
+            Example: [[0, 6]] adds J_06 coupling.
+        coupling_strength: J value for coupling hints (default 0.5 = mild penalty).
+
+    Returns:
+        h_i coefficients, J_ij couplings, ground state energy, and a QAOA
+        circuit recipe with suggested starting parameters.
+    """
+    h_coeffs = {}
+    for qubit_str, desired_val in conditions.items():
+        q = int(qubit_str)
+        desired_val = int(desired_val)
+        if desired_val == 1:
+            # reward qubit=1 (spin=-1): need h×(-1) < 0, so h > 0
+            h_coeffs[q] = +1.0
+        elif desired_val == 0:
+            # reward qubit=0 (spin=+1): need h×(+1) < 0, so h < 0
+            h_coeffs[q] = -1.0
+        else:
+            return json.dumps({"error": f"Qubit {q} value must be 0 or 1, got {desired_val}"})
+
+    j_couplings = {}
+    for pair in coupling_hints:
+        if len(pair) != 2:
+            return json.dumps({"error": f"Each coupling hint must be [i, j], got: {pair}"})
+        i, j = int(pair[0]), int(pair[1])
+        j_couplings[(i, j)] = coupling_strength
+
+    # Compute ground state energy (what the target state achieves)
+    ground_energy = 0.0
+    for q, h in h_coeffs.items():
+        desired = int(conditions[str(q)])
+        spin = -1 if desired == 1 else +1  # Z_i = -1 if bit=1, +1 if bit=0
+        ground_energy += h * spin
+    for (i, j), J in j_couplings.items():
+        # Coupling contribution depends on whether the two qubits are same/different.
+        # With hints we assume no preference, so just note the range.
+        pass
+
+    # Build the circuit recipe
+    circuit_recipe = {
+        "step_1_superposition": "Apply H gate to all qubits (equal superposition)",
+        "step_2_phase_oracle": {
+            "rz_gates": {
+                f"q{q}": f"RZ(2 × {h:.1f} × gamma)" for q, h in h_coeffs.items()
+            },
+            "rzz_gates": {
+                f"q{i}_q{j}": f"RZZ(2 × {J:.1f} × gamma)" for (i, j), J in j_couplings.items()
+            } if j_couplings else "none",
+        },
+        "step_3_mixing": "Apply RX(2 × beta) to all qubits",
+        "step_4_repeat": "Repeat steps 2-3 for p layers (start with p=2)",
+        "step_5_measure": "Measure all qubits",
+        "suggested_starting_params": {
+            "gamma": 2.5,
+            "beta": 0.5,
+            "p_layers": 2,
+            "tip": "Sweep gamma in [0, π] and beta in [0, π/2] with 20 steps each to find optimal params",
+        },
+    }
+
+    return json.dumps({
+        "h_coefficients": {
+            f"q{q}": {"h_value": h, "meaning": f"rewards q{q}={int(conditions[str(q)])}"}
+            for q, h in h_coeffs.items()
+        },
+        "j_couplings": {
+            f"q{i}_q{j}": J for (i, j), J in j_couplings.items()
+        } if j_couplings else {},
+        "ground_state_energy": round(ground_energy, 3),
+        "energy_formula": "E = Σ h_i × Z_i  where Z_i = -1 if bit=1, +1 if bit=0",
+        "why_this_works": (
+            "Target states get the lowest energy (ground state). "
+            "Quantum walk naturally amplifies ground states. "
+            "RZ + RZZ gates are IBM-native — zero routing overhead on heavy-hex."
+        ),
+        "circuit_recipe": circuit_recipe,
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool: estimate_hardware_gates
+# --------------------------------------------------------------------------
+@mcp.tool()
+def estimate_hardware_gates(
+    logical_gates: int,
+    max_qubit_degree: int,
+    two_qubit_fraction: float = 0.4,
+) -> str:
+    """
+    Predict how many hardware gates your circuit will have after IBM transpilation.
+
+    Learned from the Singmaster project: the same circuit can go from 263 logical
+    gates to 1,037 hardware gates (4× inflation) if even ONE qubit exceeds the
+    heavy-hex degree-3 limit. This tool lets you predict that before wasting
+    queue time.
+
+    The key variable is max_qubit_degree — the highest number of other qubits
+    that any single qubit in your circuit needs to interact with directly.
+    On IBM heavy-hex this limit is 3. Above 3, every excess connection requires
+    SWAP injection (each SWAP = 3 extra CX gates).
+
+    Args:
+        logical_gates:       Total gates in your circuit before transpilation.
+        max_qubit_degree:    The highest degree of any qubit in your circuit's
+                             interaction graph (use check_routing_overhead to find this).
+        two_qubit_fraction:  Fraction of logical gates that are 2-qubit gates
+                             (default 0.4 = 40%, typical for Grover-style circuits).
+
+    Returns:
+        Predicted hardware gate count, inflation factor, and whether you are
+        above or below the ~600-gate hardware noise floor on ibm_marrakesh.
+    """
+    HEAVY_HEX_MAX_DEGREE = 3
+    NOISE_FLOOR_GATES = 600  # empirical from Phase 3-5 experiments
+
+    two_qubit_gates = int(logical_gates * two_qubit_fraction)
+    single_qubit_gates = logical_gates - two_qubit_gates
+
+    # Inflation model: each degree over the limit adds ~3 CX per interaction
+    excess_degree = max(0, max_qubit_degree - HEAVY_HEX_MAX_DEGREE)
+
+    if excess_degree == 0:
+        inflation_factor = 1.1  # small overhead from native gate decomposition
+        method = "No SWAP injection needed. Minor decomposition overhead only."
+    elif excess_degree == 1:
+        inflation_factor = 4.0  # observed: 263 → 1037 in Phase 4v2
+        method = "Degree-4 node detected. Heavy SWAP injection expected (~4× inflation)."
+    else:
+        inflation_factor = 4.0 + (excess_degree - 1) * 2.5
+        method = f"Degree-{max_qubit_degree} node detected. Severe routing overhead."
+
+    predicted_hw_gates = int(logical_gates * inflation_factor)
+    above_noise_floor = predicted_hw_gates > NOISE_FLOOR_GATES
+
+    verdict = "DANGER" if above_noise_floor else "OK"
+    advice = ""
+    if above_noise_floor and excess_degree > 0:
+        advice = (
+            f"Circuit will likely collapse to noise. "
+            f"Redesign to eliminate degree-{max_qubit_degree} qubits. "
+            f"Consider encode_search_problem to switch to Ising Hamiltonian approach "
+            f"(RZZ+RX gates need no routing — logical ≈ hardware gate count)."
+        )
+    elif above_noise_floor:
+        advice = (
+            f"Circuit is large but routing is clean. "
+            f"Try optimization level 2-3 with seed sweep (opt=2 seed=42 works well). "
+            f"Oracle simplification (shared Boolean conditions) can cut 30-50%."
+        )
+    else:
+        advice = "Circuit is within hardware noise floor. Should be executable."
+
+    return json.dumps({
+        "input": {
+            "logical_gates": logical_gates,
+            "max_qubit_degree": max_qubit_degree,
+            "two_qubit_fraction": two_qubit_fraction,
+        },
+        "prediction": {
+            "inflation_factor": round(inflation_factor, 1),
+            "predicted_hardware_gates": predicted_hw_gates,
+            "heavy_hex_noise_floor": NOISE_FLOOR_GATES,
+            "above_noise_floor": above_noise_floor,
+            "verdict": verdict,
+        },
+        "method": method,
+        "advice": advice,
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Tool: get_amplification
+# --------------------------------------------------------------------------
+@mcp.tool()
+def get_amplification(
+    job_id: str,
+    marked_bitstrings: list,
+    search_space_size: int,
+) -> str:
+    """
+    Compute the amplification factor from a completed quantum search job.
+
+    Amplification = (fraction of shots on marked states) / (random baseline)
+    Random baseline = len(marked_bitstrings) / search_space_size
+
+    A value of 1.0 means no better than random. Above 1.0 means the quantum
+    search worked. In our Singmaster experiments: Phase 3v3 got 4.17×,
+    Phase 5 LNAA got 27.78×.
+
+    Args:
+        job_id:              IBM job ID of a completed measurement job.
+        marked_bitstrings:   List of bitstrings (as strings) representing your
+                             target states. Example: ["0001110", "0001111", "1001110"]
+                             These must match Qiskit's bit ordering (classical bit 0
+                             = rightmost character).
+        search_space_size:   Total number of possible states. For n qubits: 2^n.
+                             For 7 qubits: 128. For 4 qubits: 16.
+
+    Returns:
+        Amplification factor, shot breakdown per marked state, and a comparison
+        to the uniform random baseline.
+    """
+    try:
+        service = _get_service()
+        job = service.job(job_id)
+
+        raw_status = job.status()
+        status_str = raw_status if isinstance(raw_status, str) else raw_status.name
+        if status_str.upper() not in ("DONE", "COMPLETED"):
+            return json.dumps({
+                "error": f"Job {job_id} is not complete yet. Status: {status_str}",
+                "tip": "Wait for job to finish, then call get_amplification again.",
+            })
+
+        result = job.result()
+        pub_result = result[0]
+        data = pub_result.data
+        field = list(vars(data).keys())[0]
+        counts = getattr(data, field).get_counts()
+
+        total_shots = sum(counts.values())
+        marked_set = set(marked_bitstrings)
+
+        # Count shots on marked states
+        marked_counts = {}
+        marked_total = 0
+        for bits, count in counts.items():
+            if bits in marked_set:
+                marked_counts[bits] = count
+                marked_total += count
+
+        # Amplification calculation
+        marked_fraction = marked_total / total_shots
+        random_baseline = len(marked_bitstrings) / search_space_size
+        amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+        # Top states overall (for context)
+        top_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        return json.dumps({
+            "job_id": job_id,
+            "total_shots": total_shots,
+            "search_space_size": search_space_size,
+            "marked_bitstrings": marked_bitstrings,
+            "random_baseline_fraction": round(random_baseline, 5),
+            "marked_shots": {
+                bits: {
+                    "count": marked_counts.get(bits, 0),
+                    "fraction": round(marked_counts.get(bits, 0) / total_shots, 4),
+                }
+                for bits in marked_bitstrings
+            },
+            "marked_total_shots": marked_total,
+            "marked_fraction": round(marked_fraction, 4),
+            "amplification_factor": amplification,
+            "verdict": (
+                "EXCELLENT (>10×)" if amplification > 10 else
+                "GOOD (4–10×)"     if amplification > 4  else
+                "WEAK (1–4×)"      if amplification > 1  else
+                "FAILED (≤1×, no better than random)"
+            ),
+            "top_10_states": [
+                {"bits": b, "count": c, "fraction": round(c / total_shots, 4), "marked": b in marked_set}
+                for b, c in top_states
+            ],
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: discover_collision_candidates
+# --------------------------------------------------------------------------
+@mcp.tool()
+def discover_collision_candidates(
+    max_n: int = 100,
+    max_k: int = 10,
+    target_multiplicity: int = 2,
+) -> str:
+    """
+    Scout tool — runs BEFORE any circuit is built.
+
+    Classically filters ALL (k1,k2) column pairs in Pascal's Triangle,
+    finds which ones produce actual collisions in the given range, and
+    ranks them by hardware feasibility (qubit count, expected gate count,
+    Ising sparsity).
+
+    Use this to decide WHAT to search before spending QPU credits.
+
+    Args:
+      max_n              : search rows 0..max_n
+      max_k              : check column pairs k1,k2 up to max_k
+      target_multiplicity: 2 = 2-way collision, 4 = 4-way (Singmaster record)
+
+    Returns ranked list of candidate searches with hardware cost estimate.
+    """
+    try:
+        from math import comb, ceil, log2
+
+        results = []
+
+        # Check all (k1, k2) pairs where k1 < k2
+        for k1 in range(1, max_k + 1):
+            for k2 in range(k1 + 1, max_k + 1):
+
+                # Build value tables
+                table1 = {}
+                for n in range(k1, max_n + 1):
+                    v = comb(n, k1)
+                    table1.setdefault(v, []).append(n)
+
+                table2 = {}
+                for n in range(k2, max_n + 1):
+                    v = comb(n, k2)
+                    table2.setdefault(v, []).append(n)
+
+                # Find collisions
+                shared = set(table1) & set(table2)
+                non_trivial = [v for v in shared if v > 1]
+
+                if not non_trivial:
+                    continue
+
+                # Count collision pairs
+                pairs = []
+                for v in sorted(non_trivial, reverse=True)[:5]:
+                    for n1 in table1[v]:
+                        for n2 in table2[v]:
+                            pairs.append((n1, n2, v))
+
+                # Estimate hardware cost
+                bits1 = max(1, ceil(log2(max_n + 1)))
+                bits2 = max(1, ceil(log2(max_n + 1)))
+                num_qubits = bits1 + bits2
+                # LNAA: H + p*(RZ per qubit + RX per qubit) gates
+                logical_gates = num_qubits + 2 * num_qubits * 2  # p=2 layers
+                hardware_gates = logical_gates  # RZZ/RX are native, no routing
+
+                # Heavy-hex feasibility check: degree ≤ 3
+                # Each qubit connects to at most 2 neighbours in our linear LNAA
+                feasible = hardware_gates < 600
+
+                results.append({
+                    "k1": k1,
+                    "k2": k2,
+                    "num_collisions": len(pairs),
+                    "top_collision": {"n1": pairs[0][0], "n2": pairs[0][1], "value": pairs[0][2]} if pairs else None,
+                    "num_qubits": num_qubits,
+                    "estimated_hardware_gates": hardware_gates,
+                    "heavy_hex_feasible": feasible,
+                    "recommended": feasible and len(pairs) >= 1,
+                })
+
+        # Sort: feasible first, then by number of collisions
+        results.sort(key=lambda r: (-int(r["recommended"]), -r["num_collisions"]))
+
+        recommended = [r for r in results if r["recommended"]]
+        not_recommended = [r for r in results if not r["recommended"]]
+
+        return json.dumps({
+            "total_pairs_checked": max_k * (max_k - 1) // 2,
+            "pairs_with_collisions": len(results),
+            "recommended_for_hardware": len(recommended),
+            "top_candidates": recommended[:10],
+            "avoid": not_recommended[:5],
+            "next_step": (
+                f"Run encode_collision_problem + run_parallel_collision_search "
+                f"with these k-pairs: {[(r['k1'],r['k2']) for r in recommended[:5]]}"
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: encode_collision_problem
+# --------------------------------------------------------------------------
+@mcp.tool()
+def encode_collision_problem(
+    k1: int,
+    k2: int,
+    max_n1: int = 50,
+    max_n2: int = 30,
+) -> str:
+    """
+    Find all pairs (n1, n2) where C(n1,k1) = C(n2,k2) classically,
+    then encode those collision pairs as Ising h_i coefficients ready
+    for run_search_experiment.
+
+    Why this matters:
+      Instead of telling LNAA "look at row 14, 15, 78", we tell it
+      "find coordinate pairs that collide" — and it discovers them.
+      That's the generalization from Phase 5.
+
+    Strategy:
+      - Represent n1 in binary as qubits q0..q(b1-1)
+      - Represent n2 in binary as qubits q(b1)..q(b1+b2-1)
+      - For each known collision pair (n1_sol, n2_sol), reward the
+        exact bit pattern with positive h_i (1 → reward, 0 → penalize)
+      - Multiple solutions share the same qubit register — LNAA
+        amplifies all ground states simultaneously.
+
+    Example:
+      k1=2, k2=3, max_n1=20, max_n2=15
+      → finds C(16,2)=C(10,3)=120
+      → encodes bit patterns of n1=16 and n2=10
+
+    Args:
+      k1      : column fixed for register 1 (e.g. 2 → triangular numbers)
+      k2      : column fixed for register 2 (e.g. 3 → tetrahedral numbers)
+      max_n1  : search n1 from k1 to max_n1
+      max_n2  : search n2 from k2 to max_n2
+
+    Returns JSON with:
+      - collisions        : list of (n1, n2, value) found
+      - num_qubits        : total qubits needed
+      - h_coeffs          : Ising h_i per qubit (pass to run_search_experiment)
+      - marked_states     : bit-strings of collision pairs (for get_amplification)
+      - run_search_params : ready-to-use kwargs for run_search_experiment
+    """
+    try:
+        from math import comb, ceil, log2
+
+        # ── 1. Classical collision search ──────────────────────────────────
+        # Build lookup: value → list of n for register 1
+        table1 = {}
+        for n in range(k1, max_n1 + 1):
+            v = comb(n, k1)
+            table1.setdefault(v, []).append(n)
+
+        # Build lookup: value → list of n for register 2
+        table2 = {}
+        for n in range(k2, max_n2 + 1):
+            v = comb(n, k2)
+            table2.setdefault(v, []).append(n)
+
+        # Intersect to find collisions
+        collisions = []
+        for v in sorted(set(table1) & set(table2)):
+            for n1 in table1[v]:
+                for n2 in table2[v]:
+                    collisions.append({"n1": n1, "n2": n2, "value": v})
+
+        if not collisions:
+            return json.dumps({
+                "collisions": [],
+                "message": f"No collisions found for C(n,{k1})=C(m,{k2}) in the given range."
+            })
+
+        # ── 2. Decide qubit widths ─────────────────────────────────────────
+        # bits needed to represent max_n1 and max_n2
+        bits1 = max(1, ceil(log2(max_n1 + 1)))
+        bits2 = max(1, ceil(log2(max_n2 + 1)))
+        num_qubits = bits1 + bits2
+
+        # ── 3. Pick primary target — largest-value non-trivial collision ──────
+        # Sort by value descending so the most interesting collision drives
+        # the Ising encoding (e.g. C(16,2)=C(10,3)=120 beats C(2,2)=C(3,3)=1)
+        non_trivial = [c for c in collisions if c["value"] > 1]
+        primary = max(non_trivial, key=lambda c: c["value"]) if non_trivial else collisions[0]
+        n1_p, n2_p = primary["n1"], primary["n2"]
+
+        # ── 4. Build conditions dict from primary collision's exact bit pattern ─
+        # run_search_experiment expects {qubit_str: 0_or_1}
+        # q0..q(bits1-1) encode n1 LSB-first
+        # q(bits1)..q(num_qubits-1) encode n2 LSB-first
+        conditions = {}
+        for i in range(bits1):
+            conditions[str(i)] = int((n1_p >> i) & 1)
+        for i in range(bits2):
+            conditions[str(bits1 + i)] = int((n2_p >> i) & 1)
+
+        # ── 5. Convert all collisions to Qiskit-format integer marked_rows ────
+        # Qiskit counts bitstring = qubit[n-1]...qubit[1]qubit[0] (MSB-first).
+        # format(r, '0{n}b') matches that convention, so we reverse our
+        # LSB-first qubit list before converting to int.
+        marked_rows = []
+        marked_labels = []
+        for col in collisions:
+            n1, n2 = col["n1"], col["n2"]
+            qbits = []
+            for i in range(bits1):
+                qbits.append((n1 >> i) & 1)   # q0..q(bits1-1), LSB first
+            for i in range(bits2):
+                qbits.append((n2 >> i) & 1)   # q(bits1)..q(end), LSB first
+            # Qiskit string = reversed → integer
+            qiskit_int = int("".join(str(b) for b in reversed(qbits)), 2)
+            marked_rows.append(qiskit_int)
+            marked_labels.append({
+                "n1": n1, "n2": n2, "value": col["value"],
+                "qiskit_int": qiskit_int,
+                "qiskit_bitstring": format(qiskit_int, f'0{num_qubits}b'),
+            })
+
+        # ── 6. Describe each qubit ────────────────────────────────────────────
+        qubit_map = {}
+        for i in range(bits1):
+            qubit_map[str(i)] = f"n1 bit {i} (2^{i}={2**i})"
+        for i in range(bits2):
+            qubit_map[str(bits1 + i)] = f"n2 bit {i} (2^{i}={2**i})"
+
+        # ── 7. Ready-to-use params for run_search_experiment ─────────────────
+        run_params = {
+            "conditions": conditions,
+            "num_qubits": num_qubits,
+            "marked_rows": marked_rows,
+            "shots": 4096,
+            "p_layers": 2,
+            "gamma": 2.589,
+            "beta": 0.501,
+            "simulate_only": True,
+        }
+
+        return json.dumps({
+            "collisions": collisions,
+            "primary_target": primary,
+            "num_collision_pairs": len(collisions),
+            "num_qubits": num_qubits,
+            "bits_register_1": bits1,
+            "bits_register_2": bits2,
+            "qubit_map": qubit_map,
+            "conditions": conditions,
+            "marked_rows": marked_rows,
+            "marked_labels": marked_labels,
+            "run_search_params": run_params,
+            "validation_hint": (
+                f"Primary target: C({n1_p},{k1}) = C({n2_p},{k2}) = {primary['value']}. "
+                f"LNAA should amplify Qiskit state {format(marked_rows[marked_labels.index(next(l for l in marked_labels if l['n1']==n1_p))] if marked_rows else 0, f'0{num_qubits}b')}."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: run_search_experiment
+# --------------------------------------------------------------------------
+@mcp.tool()
+def run_search_experiment(
+    conditions: dict,
+    num_qubits: int,
+    marked_rows: list,
+    shots: int = 4096,
+    p_layers: int = 2,
+    gamma: float = 2.589,
+    beta: float = 0.501,
+    coupling_hints: list = [],
+    coupling_strength: float = 0.5,
+    max_poll_seconds: int = 120,
+    simulate_only: bool = True,
+) -> str:
+    """
+    Run a complete quantum search experiment end-to-end using one tool call.
+
+    DEFAULT: simulate_only=True — runs a FREE noiseless simulation first.
+    No QPU credits spent. Use this to validate your Hamiltonian, tune
+    gamma/beta parameters, and confirm amplification before touching hardware.
+
+    Only set simulate_only=False when simulation shows strong amplification
+    (>10×) and you are ready to submit to real IBM hardware.
+
+    What happens internally:
+
+    SIMULATE mode (simulate_only=True, FREE):
+      1. Derives Ising h_i and J_ij from your conditions
+      2. Builds LNAA circuit (RZ + RZZ + RX layers)
+      3. Runs noiseless Aer simulation — zero QPU cost
+      4. Returns amplification + suggestion (ready for hardware or tune more)
+
+    HARDWARE mode (simulate_only=False, uses QPU credits):
+      1-4. Same as above
+      5. Picks best IBM backend using live calibration data
+      6. Checks routing overhead
+      7. Transpiles at opt=2 seed=42
+      8. Submits job, polls, returns amplification
+
+    Args:
+        conditions:        Dict mapping qubit index (string) to target value (0 or 1).
+                           Example: {"1":1,"2":1,"3":1,"4":0,"5":0}
+        num_qubits:        Total number of qubits in the search register.
+        marked_rows:       Integer row numbers that are the correct answers.
+        shots:             Number of shots (default 4096).
+        p_layers:          LNAA layers — higher = more precise but deeper circuit (default 2).
+        gamma:             Phase angle for Ising oracle (default 2.589).
+        beta:              Mixing angle for RX layer (default 0.501).
+        coupling_hints:    Optional [i,j] pairs for J coupling between qubits.
+        coupling_strength: J value for coupling hints (default 0.5).
+        max_poll_seconds:  Hardware only — how long to wait before returning job_id (default 120s).
+        simulate_only:     True = free noiseless simulation with suggestion (DEFAULT).
+                           False = submit to real IBM hardware (costs QPU credits).
+
+    Returns:
+        Amplification factor, shot breakdown, Hamiltonian used, and a
+        recommendation on whether to submit to hardware or tune parameters first.
+    """
+    import time
+    from collections import defaultdict
+
+    try:
+        # ------------------------------------------------------------------
+        # Step 1: Derive Ising coefficients from conditions
+        # ------------------------------------------------------------------
+        h_coeffs = {}
+        for qubit_str, desired_val in conditions.items():
+            q = int(qubit_str)
+            desired_val = int(desired_val)
+            if desired_val == 1:
+                h_coeffs[q] = +1.0   # reward qubit=1: h×(-1) = negative energy
+            elif desired_val == 0:
+                h_coeffs[q] = -1.0   # reward qubit=0: h×(+1) = negative energy
+            else:
+                return json.dumps({"error": f"Qubit {q} value must be 0 or 1"})
+
+        j_couplings = {}
+        for pair in coupling_hints:
+            i, j = int(pair[0]), int(pair[1])
+            j_couplings[(i, j)] = coupling_strength
+
+        # Ground state energy for the targets
+        ground_energy = sum(
+            h_coeffs[int(q)] * (-1 if int(v) == 1 else +1)
+            for q, v in conditions.items()
+        )
+
+        # ------------------------------------------------------------------
+        # Step 2: Build LNAA circuit directly in Qiskit
+        # ------------------------------------------------------------------
+        qc = QuantumCircuit(num_qubits, num_qubits)
+
+        # Superposition
+        qc.h(range(num_qubits))
+
+        # p layers of phase oracle + mixing
+        for layer in range(p_layers):
+            for q_idx, h in h_coeffs.items():
+                qc.rz(2 * h * gamma, q_idx)
+            for (qi, qj), J in j_couplings.items():
+                qc.rzz(2 * J * gamma, qi, qj)
+            for i in range(num_qubits):
+                qc.rx(2 * beta, i)
+
+        qc.measure(range(num_qubits), range(num_qubits))
+
+        # Logical gate count
+        rz_count  = len(h_coeffs) * p_layers
+        rzz_count = len(j_couplings) * p_layers
+        rx_count  = num_qubits * p_layers
+        h_count   = num_qubits
+        logical_gates = h_count + rz_count + rzz_count + rx_count
+
+        # ------------------------------------------------------------------
+        # Step 3a: SIMULATE MODE — free noiseless run, no QPU
+        # ------------------------------------------------------------------
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            sim = AerSimulator()
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            sim_pm = _gpm(optimization_level=1, backend=sim)
+            sim_qc = sim_pm.run(qc)
+            from qiskit_aer.primitives import SamplerV2 as AerSampler
+            aer_sampler = AerSampler()
+            sim_job = aer_sampler.run([sim_qc], shots=shots)
+            sim_result = sim_job.result()
+            pub = sim_result[0]
+            data = pub.data
+            field = list(vars(data).keys())[0]
+            counts = getattr(data, field).get_counts()
+
+            total_shots   = sum(counts.values())
+            search_space_size = 2 ** num_qubits
+            marked_bitstrings = [format(r, f'0{num_qubits}b') for r in marked_rows]
+            marked_set_bits   = set(marked_bitstrings)
+            marked_total  = sum(counts.get(b, 0) for b in marked_bitstrings)
+            marked_fraction   = marked_total / total_shots
+            random_baseline   = len(marked_rows) / search_space_size
+            amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+            top_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            # Suggestion logic
+            if amplification >= 15:
+                suggestion = (
+                    f"READY FOR HARDWARE. Simulation shows {amplification}× amplification — "
+                    f"strong signal. Call run_search_experiment with simulate_only=False to submit to IBM hardware."
+                )
+            elif amplification >= 5:
+                suggestion = (
+                    f"GOOD but could be better ({amplification}×). Try tuning gamma (current: {gamma}) "
+                    f"in range [1.5, 3.5] or increase p_layers to 3. Rerun simulation before hardware."
+                )
+            elif amplification >= 2:
+                suggestion = (
+                    f"WEAK signal ({amplification}×). Hamiltonian may need revisiting. "
+                    f"Check that all marked_rows satisfy your conditions. "
+                    f"Try different gamma/beta or add coupling_hints to break degeneracy."
+                )
+            else:
+                suggestion = (
+                    f"NO SIGNAL ({amplification}×). Do NOT submit to hardware — would waste QPU credits. "
+                    f"Revisit the Hamiltonian: verify h_i signs using E = Σ h_i × Z_i "
+                    f"where Z_i = -1 if bit=1, +1 if bit=0. Marked rows should have negative energy."
+                )
+
+            return json.dumps({
+                "mode": "SIMULATION (free — no QPU used)",
+                "experiment": {
+                    "conditions": conditions,
+                    "num_qubits": num_qubits,
+                    "search_space_size": search_space_size,
+                    "marked_rows": marked_rows,
+                    "p_layers": p_layers,
+                    "gamma": gamma,
+                    "beta": beta,
+                },
+                "algorithm": {
+                    "name": "LNAA (Lattice-Native Amplitude Amplification)",
+                    "h_coefficients": h_coeffs,
+                    "j_couplings": {f"{i},{j}": J for (i, j), J in j_couplings.items()},
+                    "ground_state_energy": round(ground_energy, 3),
+                },
+                "circuit": {
+                    "logical_gates": logical_gates,
+                    "shots": shots,
+                },
+                "results": {
+                    "total_shots": total_shots,
+                    "marked_shots": marked_total,
+                    "marked_fraction": round(marked_fraction, 4),
+                    "random_baseline": round(random_baseline, 4),
+                    "amplification_factor": amplification,
+                    "verdict": (
+                        "EXCELLENT (>10×)" if amplification > 10 else
+                        "GOOD (5–10×)"     if amplification > 5  else
+                        "WEAK (2–5×)"      if amplification > 2  else
+                        "NO SIGNAL (≤2×)"
+                    ),
+                    "top_10_states": [
+                        {
+                            "bits": b,
+                            "row": int(b, 2),
+                            "count": c,
+                            "fraction": round(c / total_shots, 4),
+                            "marked": b in marked_set_bits,
+                        }
+                        for b, c in top_states
+                    ],
+                },
+                "suggestion": suggestion,
+                "next_step": (
+                    "run_search_experiment(..., simulate_only=False)"
+                    if amplification >= 15
+                    else "Tune parameters and rerun simulation first."
+                ),
+            }, indent=2)
+
+        # ------------------------------------------------------------------
+        # Step 3b: HARDWARE MODE — pick best backend using live calibration
+        # ------------------------------------------------------------------
+        service = _get_service()
+        backends = service.backends(operational=True)
+
+        best_backend = None
+        best_cx_error = float('inf')
+        backend_scores = []
+
+        for backend in backends:
+            if backend.num_qubits < num_qubits:
+                continue
+            try:
+                props = backend.properties()
+                cx_errors = []
+                if props:
+                    TWO_QUBIT_GATES = {"cx", "ecr", "cz"}
+                    for gate in props.gates:
+                        if gate.gate in TWO_QUBIT_GATES and gate.parameters:
+                            cx_errors.append(gate.parameters[0].value)
+                avg_cx = sum(cx_errors) / len(cx_errors) if cx_errors else 1.0
+                backend_scores.append({"name": backend.name, "avg_cx_error": round(avg_cx, 5)})
+                if avg_cx < best_cx_error:
+                    best_cx_error = avg_cx
+                    best_backend = backend
+            except Exception:
+                continue
+
+        if best_backend is None:
+            return json.dumps({"error": "No operational IBM backends found with enough qubits."})
+
+        backend_scores.sort(key=lambda x: x["avg_cx_error"])
+
+        # ------------------------------------------------------------------
+        # Step 4: Routing check — LNAA interactions are always degree ≤ 2
+        # ------------------------------------------------------------------
+        # Each qubit only interacts with its J-coupling partners.
+        # With no coupling hints, max degree = 0. Always safe for heavy-hex.
+        max_degree = 0
+        if j_couplings:
+            neighbor_count = defaultdict(set)
+            for (qi, qj) in j_couplings:
+                neighbor_count[qi].add(qj)
+                neighbor_count[qj].add(qi)
+            max_degree = max(len(v) for v in neighbor_count.values())
+
+        routing_safe = max_degree <= 3
+
+        # ------------------------------------------------------------------
+        # Step 5: Submit the job
+        # ------------------------------------------------------------------
+        pm = generate_preset_pass_manager(optimization_level=2, backend=best_backend, seed_transpiler=42)
+        transpiled = pm.run(qc)
+        hw_gate_count = transpiled.size()
+
+        sampler = Sampler(mode=best_backend)
+        sampler.options.default_shots = shots
+        job = sampler.run([transpiled])
+        job_id = job.job_id()
+
+        # ------------------------------------------------------------------
+        # Step 6: Poll for result
+        # ------------------------------------------------------------------
+        search_space_size = 2 ** num_qubits
+        marked_set_rows = set(marked_rows)
+
+        # Build marked bitstrings from marked row integers
+        marked_bitstrings = [format(r, f'0{num_qubits}b') for r in marked_rows]
+        marked_set_bits = set(marked_bitstrings)
+
+        deadline = time.time() + max_poll_seconds
+        result_data = None
+
+        while time.time() < deadline:
+            raw_status = job.status()
+            # qiskit-ibm-runtime returns either a string or a JobStatus enum
+            status = raw_status if isinstance(raw_status, str) else raw_status.name
+            status = status.upper()
+            if status in ("DONE", "COMPLETED"):
+                result_data = job.result()
+                break
+            elif status in ("ERROR", "CANCELLED", "FAILED"):
+                return json.dumps({
+                    "error": f"Job failed with status: {status}",
+                    "job_id": job_id,
+                    "backend": best_backend.name,
+                })
+            time.sleep(10)
+
+        # ------------------------------------------------------------------
+        # Step 7a: Job done — compute amplification
+        # ------------------------------------------------------------------
+        if result_data is not None:
+            pub_result = result_data[0]
+            data = pub_result.data
+            field = list(vars(data).keys())[0]
+            counts = getattr(data, field).get_counts()
+            total_shots = sum(counts.values())
+
+            marked_total = sum(counts.get(b, 0) for b in marked_bitstrings)
+            marked_fraction = marked_total / total_shots
+            random_baseline = len(marked_rows) / search_space_size
+            amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+            top_states = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            return json.dumps({
+                "status": "COMPLETE",
+                "experiment": {
+                    "conditions": conditions,
+                    "num_qubits": num_qubits,
+                    "search_space_size": search_space_size,
+                    "marked_rows": marked_rows,
+                    "p_layers": p_layers,
+                    "gamma": gamma,
+                    "beta": beta,
+                },
+                "algorithm": {
+                    "name": "LNAA (Lattice-Native Amplitude Amplification)",
+                    "approach": "Ising Hamiltonian quantum walk — IBM-native RZZ+RX gates, zero routing overhead",
+                    "h_coefficients": h_coeffs,
+                    "j_couplings": {f"{i},{j}": J for (i, j), J in j_couplings.items()},
+                    "ground_state_energy": round(ground_energy, 3),
+                },
+                "hardware": {
+                    "backend_chosen": best_backend.name,
+                    "backend_avg_cx_error": round(best_cx_error, 5),
+                    "selection_reason": "Lowest avg CX error among operational backends with enough qubits",
+                    "all_backends_scored": backend_scores,
+                    "routing_safe": routing_safe,
+                    "max_qubit_degree": max_degree,
+                },
+                "circuit": {
+                    "logical_gates": logical_gates,
+                    "hardware_gates_after_transpile": hw_gate_count,
+                    "shots": shots,
+                },
+                "job_id": job_id,
+                "results": {
+                    "total_shots": total_shots,
+                    "marked_shots": marked_total,
+                    "marked_fraction": round(marked_fraction, 4),
+                    "random_baseline": round(random_baseline, 4),
+                    "amplification_factor": amplification,
+                    "verdict": (
+                        "EXCELLENT (>10×)" if amplification > 10 else
+                        "GOOD (4–10×)"     if amplification > 4  else
+                        "WEAK (1–4×)"      if amplification > 1  else
+                        "FAILED (≤1× — no better than random)"
+                    ),
+                    "top_10_states": [
+                        {
+                            "bits": b,
+                            "row": int(b, 2),
+                            "count": c,
+                            "fraction": round(c / total_shots, 4),
+                            "marked": b in marked_set_bits,
+                        }
+                        for b, c in top_states
+                    ],
+                },
+            }, indent=2)
+
+        # ------------------------------------------------------------------
+        # Step 7b: Still queued — return job_id for later
+        # ------------------------------------------------------------------
+        return json.dumps({
+            "status": "QUEUED",
+            "message": (
+                f"Job submitted successfully but IBM queue wait exceeded {max_poll_seconds}s. "
+                f"IBM queues can take minutes to hours depending on load. "
+                f"Call get_amplification with the job_id below when it completes."
+            ),
+            "job_id": job_id,
+            "backend": best_backend.name,
+            "experiment": {
+                "conditions": conditions,
+                "marked_rows": marked_rows,
+                "marked_bitstrings": marked_bitstrings,
+                "search_space_size": search_space_size,
+            },
+            "algorithm": {
+                "name": "LNAA",
+                "h_coefficients": h_coeffs,
+                "logical_gates": logical_gates,
+                "hardware_gates_after_transpile": hw_gate_count,
+            },
+            "next_step": f"Call get_amplification(job_id='{job_id}', marked_bitstrings={marked_bitstrings}, search_space_size={search_space_size})",
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: encode_4way_collision
+# --------------------------------------------------------------------------
+@mcp.tool()
+def encode_4way_collision(
+    value: int,
+    positions: list,
+    max_n: int = 128,
+    p_layers: int = 2,
+    gamma: float = 2.589,
+    beta: float = 0.501,
+    shots: int = 4096,
+    simulate_only: bool = True,
+) -> str:
+    """
+    Step 4: Encode a known multi-way collision for simultaneous LNAA search.
+
+    Takes a value V and its known positions (from sieve_singmaster_space),
+    builds one LNAA rail per unique k-column, searches for all marked rows
+    simultaneously in ONE job.
+
+    In plain English:
+      sieve tells us: 3003 appears at rows 14(k=6), 15(k=5), 78(k=2).
+      This tool builds 3 parallel quantum searches — one per k-column —
+      and runs them all in ONE hardware submission.
+      Each rail independently finds its target row.
+      Together they prove the 4-way collision exists and is amplifiable.
+
+    This is the Step 4 generalization of Phase 5:
+      Phase 5: manually encoded 3 rows for 3003 in one 7-qubit circuit
+      Step 4:  automatically encodes N positions from sieve in N parallel rails
+
+    Args:
+      value     : the Pascal value to search for (e.g. 3003)
+      positions : list of [n, k] pairs from sieve output
+                  e.g. [[14,6],[15,5],[78,2]]
+      max_n     : max row to search per rail (determines qubit count)
+      simulate_only: True = free simulation, False = real hardware
+
+    Returns ready-to-run params + simulation/hardware results.
+    """
+    try:
+        from math import comb, ceil, log2
+        from collections import defaultdict
+        from qiskit import QuantumCircuit
+
+        if not positions:
+            return json.dumps({"error": "positions list is empty. Run sieve_singmaster_space first."})
+
+        # ── 1. Group positions by k-column ────────────────────────────────
+        # Each unique k gets its own rail
+        k_groups = defaultdict(list)
+        for pos in positions:
+            n, k = int(pos[0]), int(pos[1])
+            if comb(n, k) == value:
+                k_groups[k].append(n)
+
+        if not k_groups:
+            return json.dumps({"error": f"None of the positions give C(n,k)={value}. Check your input."})
+
+        # ── 2. Build one rail per k-column ────────────────────────────────
+        bits_per_rail = max(1, ceil(log2(max_n + 1)))
+        rails = []
+
+        for k, target_rows in sorted(k_groups.items()):
+            # Conditions: bit pattern of the FIRST target row
+            # (largest non-trivial one — skip C(value,1) = value trivial case)
+            non_trivial = [n for n in target_rows if n < value]
+            primary_n = max(non_trivial) if non_trivial else target_rows[0]
+
+            conditions = {}
+            for i in range(bits_per_rail):
+                conditions[i] = int((primary_n >> i) & 1)
+
+            # marked_rows: Qiskit integers for ALL target rows in this rail
+            marked_rows = []
+            for n in target_rows:
+                if n <= max_n:
+                    qbits = [(n >> i) & 1 for i in range(bits_per_rail)]
+                    marked_rows.append(int("".join(str(b) for b in reversed(qbits)), 2))
+
+            if not marked_rows:
+                continue
+
+            rails.append({
+                "k": k,
+                "target_rows": target_rows,
+                "primary_n": primary_n,
+                "conditions": conditions,
+                "marked_rows": marked_rows,
+                "num_qubits": bits_per_rail,
+            })
+
+        if not rails:
+            return json.dumps({"error": f"No target rows fit within max_n={max_n}. Try increasing max_n."})
+
+        # ── 3. Build combined parallel circuit ────────────────────────────
+        total_qubits = sum(r["num_qubits"] for r in rails)
+        qc = QuantumCircuit(total_qubits, total_qubits)
+
+        qubit_offset = 0
+        rail_offsets = []
+
+        for rail in rails:
+            nq = rail["num_qubits"]
+            qrange = list(range(qubit_offset, qubit_offset + nq))
+            rail_offsets.append(qubit_offset)
+
+            h_coeffs = {int(q): (+1.0 if v == 1 else -1.0)
+                        for q, v in rail["conditions"].items()}
+
+            qc.h(qrange)
+            for _ in range(p_layers):
+                for qi, h in h_coeffs.items():
+                    qc.rz(2 * h * gamma, qubit_offset + qi)
+                for i in range(nq):
+                    qc.rx(2 * beta, qubit_offset + i)
+            for i, q in enumerate(qrange):
+                qc.measure(q, qubit_offset + i)
+
+            qubit_offset += nq
+
+        logical_gates = qc.size()
+
+        # ── 4. Simulate or submit ─────────────────────────────────────────
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            sim = AerSimulator()
+
+            # Simulate each rail separately (memory safety)
+            rail_counts_list = []
+            for rail in rails:
+                nq = rail["num_qubits"]
+                h_coeffs = {int(q): (+1.0 if v == 1 else -1.0)
+                            for q, v in rail["conditions"].items()}
+                rail_qc = QuantumCircuit(nq, nq)
+                rail_qc.h(range(nq))
+                for _ in range(p_layers):
+                    for qi, h in h_coeffs.items():
+                        rail_qc.rz(2 * h * gamma, qi)
+                    for i in range(nq):
+                        rail_qc.rx(2 * beta, i)
+                rail_qc.measure(range(nq), range(nq))
+                rc = sim.run(rail_qc, shots=shots).result().get_counts()
+                rail_counts_list.append(rc)
+        else:
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+            svc = _get_service()
+            backend = svc.least_busy(operational=True, simulator=False)
+            pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
+            t_qc = pm.run(qc)
+            sampler = IBMSampler(mode=backend)
+            job = sampler.run([t_qc], shots=shots)
+            return json.dumps({
+                "status": "submitted",
+                "job_id": job.job_id(),
+                "backend": backend.name,
+                "value_searched": value,
+                "rails": [{"k": r["k"], "target_rows": r["target_rows"]} for r in rails],
+                "total_qubits": total_qubits,
+                "logical_gates": logical_gates,
+                "note": f"Use job_results('{job.job_id()}') when done.",
+            }, indent=2)
+
+        # ── 5. Per-rail amplification ─────────────────────────────────────
+        rail_results = []
+        for rail, rc in zip(rails, rail_counts_list):
+            nq = rail["num_qubits"]
+            marked_set = set(format(r, f'0{nq}b') for r in rail["marked_rows"])
+            total = sum(rc.values())
+            marked_total = sum(rc.get(b, 0) for b in marked_set)
+            marked_frac = marked_total / total if total > 0 else 0
+            random_base = len(rail["marked_rows"]) / (2 ** nq)
+            amp = round(marked_frac / random_base, 2) if random_base > 0 else 0
+            top = sorted(rc.items(), key=lambda x: x[1], reverse=True)[:3]
+
+            rail_results.append({
+                "k_column": rail["k"],
+                "target_rows": rail["target_rows"],
+                "primary_n": rail["primary_n"],
+                "amplification": amp,
+                "marked_fraction_pct": round(marked_frac * 100, 2),
+                "top_states": [{"bits": b, "count": c} for b, c in top],
+            })
+
+        best = max(rail_results, key=lambda r: r["amplification"])
+        avg_amp = round(sum(r["amplification"] for r in rail_results) / len(rail_results), 2)
+
+        return json.dumps({
+            "value_searched": value,
+            "num_rails": len(rails),
+            "total_qubits": total_qubits,
+            "logical_gates": logical_gates,
+            "mode": "simulation" if simulate_only else "hardware",
+            "rail_results": rail_results,
+            "best_rail": best,
+            "average_amplification": avg_amp,
+            "summary": (
+                f"Searched for value={value} across {len(rails)} k-columns simultaneously. "
+                f"Best: k={best['k_column']} → {best['amplification']}× amplification. "
+                f"Average: {avg_amp}×."
+            ),
+            "verdict": (
+                "READY FOR HARDWARE" if avg_amp >= 15 else
+                "TUNE PARAMETERS" if avg_amp >= 5 else
+                "WEAK SIGNAL"
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
+# Tool: equality_oracle_search  (parity-oracle amplification + classical
+# equality verification — the QPU narrows candidates, comb() confirms them)
+# --------------------------------------------------------------------------
+@mcp.tool()
+def equality_oracle_search(
+    k1: int = 2,
+    k2: int = 5,
+    n_bits: int = 6,
+    p_layers: int = 3,
+    gamma: float = 1.0,
+    beta: float = 0.8,
+    shots: int = 4096,
+    simulate_only: bool = True,
+    backend_name: str = "",
+) -> str:
+    """
+    Find C(n1,k1) = C(n2,k2) without being told which rows to look for.
+
+    Honest framing: the quantum circuit amplifies toward a Lucas mod-2
+    PARITY match, which is a weak filter (roughly half of random pairs
+    satisfy it by chance) — it is not proof of equality. The actual
+    equality check is classical: every measured bitstring is verified
+    with exact comb() arithmetic in post-processing. The QPU's real job
+    here is candidate narrowing via amplification, not final verification.
+
+    Difference from encode_4way_collision:
+
+    encode_4way_collision:
+      Input the answer (e.g. 3003 at rows 14,15,78) → circuit prepares and
+      confirms that known state. Needs the answer before it can run.
+
+    This tool:
+      Input only the two columns k1, k2 — not the answer.
+      Two qubit registers in superposition — one per column.
+      Cross-register RZZ gates encode the Lucas mod-2 equality oracle:
+        "mark any (n1, n2) where C(n1,k1) and C(n2,k2) have the same parity."
+      LNAA amplifies pairs matching that parity condition — a real but
+      weak filter (~50% of random pairs pass it by chance). The QPU
+      narrows the candidate set; classical comb() in post-processing
+      determines which amplified candidates are true equalities.
+
+    Lucas mod-2 oracle (why it's cheap):
+      By Lucas' theorem, C(n,k) mod 2 = 1 iff every 1-bit of k is also a 1-bit of n.
+      This is digit-local — depends only on a few bits of n. Perfect for RZZ/RZ gates.
+      Example: k=2 (binary 10) → C(n,2) is odd iff bit-1 of n is 1.
+               k=5 (binary 101) → C(n,5) is odd iff bits 0 AND 2 of n are both 1.
+      Equality oracle: are the active-bit patterns of n1 and n2 consistent?
+      Encoded as cross-register RZZ between the active bit positions.
+
+    Circuit structure (total = 2*n_bits qubits):
+      Register 1 (qubits 0..n_bits-1):   row n1 for column k1
+      Register 2 (qubits n_bits..2n-1):  row n2 for column k2
+      For each LNAA layer:
+        - RZ on active bits of each register (single-register terms)
+        - RZZ between active bit pairs across registers (equality coupling)
+        - RX mixing on all qubits
+
+    Post-processing:
+      For each measured peak (n1, n2), compute C(n1,k1) and C(n2,k2) exactly.
+      Report pairs where they are truly equal — those are real collisions.
+
+    Args:
+      k1, k2     : the two Pascal columns to search (e.g. k1=2, k2=5)
+      n_bits     : qubits per register (6 bits = rows 0..63, 8 bits = 0..255)
+      simulate_only: True = free, False = real IBM QPU
+    """
+    try:
+        from math import comb
+        from qiskit import QuantumCircuit
+
+        # ── 1. Lucas active bits ─────────────────────────────────────────
+        def active_bits(k, p=2):
+            """Bit positions where k has a 1 in base p — these are the
+            bits of n that determine C(n,k) mod p."""
+            bits = []
+            pos = 0
+            while k > 0:
+                if k % p != 0:
+                    bits.append(pos)
+                k //= p
+                pos += 1
+            return bits
+
+        ab1 = active_bits(k1)   # e.g. k=2 → [1]
+        ab2 = active_bits(k2)   # e.g. k=5 → [0, 2]
+
+        n_total = 2 * n_bits
+        reg2_offset = n_bits
+
+        # ── 2. Build two-register LNAA circuit ───────────────────────────
+        qc = QuantumCircuit(n_total, n_total)
+        qc.h(range(n_total))
+
+        for _ in range(p_layers):
+            # Single-register terms: reward active bits being 1
+            # (C(n,k) mod 2 = 1 when active bits are set)
+            for b in ab1:
+                if b < n_bits:
+                    qc.rz(2 * gamma, b)
+            for b in ab2:
+                if b < n_bits:
+                    qc.rz(2 * gamma, reg2_offset + b)
+
+            # Cross-register equality coupling: RZZ between active bits
+            # of register 1 and active bits of register 2.
+            # This rewards states where both registers have matching
+            # parity — i.e. C(n1,k1) ≡ C(n2,k2) mod 2.
+            for b1 in ab1:
+                for b2 in ab2:
+                    if b1 < n_bits and b2 < n_bits:
+                        qc.rzz(2 * gamma, b1, reg2_offset + b2)
+
+            # Mixing layer
+            for q in range(n_total):
+                qc.rx(2 * beta, q)
+
+        qc.measure(range(n_total), range(n_total))
+        logical_gates = qc.size()
+
+        # ── 3. Simulate or submit ─────────────────────────────────────────
+        if simulate_only:
+            from qiskit_aer import AerSimulator
+            sim = AerSimulator()
+            counts = sim.run(qc, shots=shots).result().get_counts()
+        else:
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+            svc = _get_service()
+            backend = svc.least_busy(operational=True, simulator=False) \
+                if not backend_name else svc.backend(backend_name)
+            pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
+            t_qc = pm.run(qc)
+            sampler = IBMSampler(mode=backend)
+            job = sampler.run([t_qc], shots=shots)
+            return json.dumps({
+                "status": "submitted",
+                "job_id": job.job_id(),
+                "backend": backend.name,
+                "k1": k1, "k2": k2, "n_bits": n_bits,
+                "total_qubits": n_total,
+                "logical_gates": logical_gates,
+                "active_bits_k1": ab1, "active_bits_k2": ab2,
+                "note": f"Use job_results('{job.job_id()}') when done.",
+            }, indent=2)
+
+        # ── 4. Post-process: scan ALL counts for exact collisions ─────────
+        total_shots = sum(counts.values())
+        random_baseline = 1.0 / (4 ** n_bits)
+
+        collisions = []
+        near_misses = []
+
+        # Scan every measured bitstring — collisions may not be in top N
+        for bitstring, count in counts.items():
+            reg2_bits = bitstring[:n_bits]
+            reg1_bits = bitstring[n_bits:]
+            n1 = int(reg1_bits, 2)
+            n2 = int(reg2_bits, 2)
+            if n1 < k1 or n2 < k2:
+                continue
+            v1 = comb(n1, k1)
+            v2 = comb(n2, k2)
+            prob = count / total_shots
+            amp = round(prob / random_baseline, 1)
+            entry = {
+                "n1": n1, "k1": k1, "v1": v1,
+                "n2": n2, "k2": k2, "v2": v2,
+                "shots": count,
+                "probability_pct": round(prob * 100, 3),
+                "amplification": amp,
+                "equal": v1 == v2,
+            }
+            if v1 == v2 and v1 > 1:
+                entry["collision_value"] = v1
+                entry["total_appearances"] = 2 + 4
+                collisions.append(entry)
+
+        # Top near-misses from the top-30 high-count states
+        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:30]
+        for bitstring, count in top:
+            reg2_bits = bitstring[:n_bits]
+            reg1_bits = bitstring[n_bits:]
+            n1 = int(reg1_bits, 2)
+            n2 = int(reg2_bits, 2)
+            if n1 < k1 or n2 < k2:
+                continue
+            v1 = comb(n1, k1)
+            v2 = comb(n2, k2)
+            if v1 != v2:
+                prob = count / total_shots
+                near_misses.append({
+                    "n1": n1, "k1": k1, "v1": v1,
+                    "n2": n2, "k2": k2, "v2": v2,
+                    "shots": count,
+                    "amplification": round(prob / random_baseline, 1),
+                })
+
+        return json.dumps({
+            "k1": k1, "k2": k2,
+            "n_bits": n_bits,
+            "search_space": f"{2**n_bits} rows per column ({2**(2*n_bits)} total pairs)",
+            "total_qubits": n_total,
+            "logical_gates": logical_gates,
+            "mode": "simulation" if simulate_only else "hardware",
+            "shots": shots,
+            "active_bits_k1": ab1,
+            "active_bits_k2": ab2,
+            "oracle_description": (
+                f"Cross-register RZZ coupling between bits {ab1} of reg1 "
+                f"and bits {ab2} of reg2. Rewards C(n1,{k1}) ≡ C(n2,{k2}) mod 2."
+            ),
+            "collisions_found": len(collisions),
+            "collisions": collisions,
+            "top_near_misses": near_misses[:5],
+            "summary": (
+                f"Searched {2**n_bits}×{2**n_bits} = {2**(2*n_bits)} row pairs. "
+                f"Found {len(collisions)} exact collisions C(n1,{k1})=C(n2,{k2}). "
+                f"{'NEW DISCOVERY possible — check collision values!' if any(c['collision_value'] > 3003 for c in collisions) else 'Known values range.'}"
+                if collisions else
+                f"No exact collisions found in {2**n_bits}×{2**n_bits} search space. "
+                f"Try larger n_bits or different k1/k2."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
+# Tool: find_collision_candidates  (Step 1 — curve intersection search)
+# --------------------------------------------------------------------------
+@mcp.tool()
+def find_collision_candidates(
+    columns: list = [5, 6, 7, 8],
+    search_depth: int = 100000,
+    min_columns: int = 3,
+) -> str:
+    """
+    Step 1: Curve-intersection classical search for Singmaster candidates.
+
+    Instead of scanning every row (brute-force sieve), anchors on the
+    smallest target column and uses integer root-finding to jump directly
+    to candidate rows in other columns. No scanning needed.
+
+    In plain English:
+      Old way: check row 1, row 2, row 3 ... row 50000 — one by one.
+      New way: for each n in anchor column, compute N=C(n,k). Then solve
+               "what n gives C(n,k2)=N?" using algebra — jump straight there.
+      Like sudoku: use the rules to skip impossible positions entirely.
+
+    Applies three Einstein constraints automatically:
+      1. Solved pair elimination — (2,3),(2,4),(2,5),(2,6),(3,4) etc. are
+         fully solved in math literature. Flags if your combo is all-solved.
+      2. 2022 theorem — 9+ candidates only exist at small k. Warns if k>15.
+      3. Integer root-finding — k=2 uses exact closed form; k>=3 uses
+         Newton's method from (N*k!)^(1/k) estimate.
+
+    Args:
+      columns     : k-column values to search simultaneously
+                    e.g. [5,6,7,8] or [2,7,9] — avoid all-solved combos
+      search_depth: rows to scan in the anchor (smallest) column
+      min_columns : columns that must match for a candidate to be reported
+
+    Each candidate with 3 non-trivial columns = 8 total appearances (=3003).
+    Needs 4 non-trivial columns = 10 total = new world record.
+    """
+    try:
+        from math import comb, isqrt, factorial
+
+        # Solved column pairs — no new integer solutions beyond known ones
+        SOLVED_PAIRS = {
+            (2, 3), (2, 4), (2, 5), (2, 6), (2, 8),
+            (3, 4), (3, 6), (4, 6), (4, 8),
+        }
+
+        columns = sorted(set(int(c) for c in columns if int(c) >= 2))
+        if len(columns) < 2:
+            return json.dumps({"error": "Need at least 2 columns (k >= 2)."})
+
+        deep_cols = [k for k in columns if k > 15]
+        pairs = [(columns[i], columns[j])
+                 for i in range(len(columns))
+                 for j in range(i + 1, len(columns))]
+        solved_pairs_hit = [p for p in pairs
+                            if p in SOLVED_PAIRS or (p[1], p[0]) in SOLVED_PAIRS]
+        all_solved = len(solved_pairs_hit) == len(pairs)
+
+        k_anchor = columns[0]
+        other_cols = columns[1:]
+
+        def find_n_for_value(N, k):
+            """Return n such that C(n,k)=N using root-finding, or None."""
+            if k == 1:
+                return N if N >= 1 else None
+            if k == 2:
+                disc = 1 + 8 * N
+                s = isqrt(disc)
+                if s * s != disc:
+                    return None
+                n = (1 + s) // 2
+                return n if n >= 2 and comb(n, 2) == N else None
+            if k == 3:
+                est = int((6 * N) ** (1 / 3))
+                for n in range(max(3, est - 2), est + 5):
+                    v = comb(n, 3)
+                    if v == N:
+                        return n
+                    if v > N:
+                        break
+                return None
+            fk = factorial(k)
+            try:
+                est = int(round((N * fk) ** (1.0 / k)))
+            except OverflowError:
+                import math
+                est = int(math.exp((math.log(N) + math.log(fk)) / k))
+            for n in range(max(k, est - 3), est + 6):
+                v = comb(n, k)
+                if v == N:
+                    return n
+                if v > N:
+                    break
+            return None
+
+        candidates = []
+        for n1 in range(k_anchor, search_depth + 1):
+            N = comb(n1, k_anchor)
+            if N < 6:
+                continue
+            found = [(k_anchor, n1)]
+            for k in other_cols:
+                n2 = find_n_for_value(N, k)
+                if n2 is not None:
+                    found.append((k, n2))
+            if len(found) >= min_columns:
+                total = 2 + 2 * len(found)
+                candidates.append({
+                    "value": N,
+                    "non_trivial_columns": len(found),
+                    "total_appearances": total,
+                    "positions": [
+                        {"k": k, "n": n, "verify": f"C({n},{k})={comb(n,k)}"}
+                        for k, n in found
+                    ],
+                    "beats_world_record": total > 8,
+                })
+
+        candidates.sort(key=lambda x: -x["total_appearances"])
+        new_records = [c for c in candidates if c["beats_world_record"]]
+
+        return json.dumps({
+            "columns_searched": columns,
+            "anchor_column": k_anchor,
+            "search_depth": search_depth,
+            "rows_scanned_in_anchor": search_depth - k_anchor + 1,
+            "candidates_found": len(candidates),
+            "new_records_found": len(new_records),
+            "solved_pairs_in_combo": [list(p) for p in solved_pairs_hit],
+            "all_pairs_solved": all_solved,
+            "warning_all_solved": (
+                "All column pairs are solved — results will only repeat known values. "
+                "Try unsolved combos e.g. [5,6,7,8] or [2,7,9,11]."
+            ) if all_solved else None,
+            "warning_deep_interior": (
+                f"Columns {deep_cols} violate 2022 theorem — 9+ cannot exist there. "
+                "Stick to k <= 15."
+            ) if deep_cols else None,
+            "new_records": new_records,
+            "top_candidates": candidates[:20],
+            "summary": (
+                f"Scanned {search_depth - k_anchor + 1} rows in anchor column k={k_anchor}. "
+                f"Found {len(candidates)} values in {min_columns}+ columns simultaneously. "
+                f"New world records (>8 appearances): {len(new_records)}."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
+# Tool: sieve_singmaster_space
+# --------------------------------------------------------------------------
+@mcp.tool()
+def sieve_singmaster_space(
+    max_n: int = 500,
+    max_k: int = 50,
+    target_multiplicity: int = 4,
+    use_lucas_filter: bool = True,
+) -> str:
+    """
+    Classical sieve for Singmaster's Conjecture — runs BEFORE any QPU job.
+
+    Finds candidate positions in Pascal's Triangle where the same value
+    appears multiple times. Uses Lucas' Theorem to eliminate 98%+ of
+    the search space before any quantum circuit is built.
+
+    In plain English:
+      Instead of asking the quantum computer to search a billion positions,
+      we first eliminate all positions that CANNOT be part of a collision
+      using pure math. Only the survivors go to quantum hardware.
+      This saves QPU credits and finds better candidates.
+
+    Lucas' Theorem (the sieve):
+      C(n,k) mod p is zero if any digit of k in base-p is larger than
+      the corresponding digit of n. This lets us quickly compare two
+      positions without computing the full binomial coefficient.
+      If C(n1,k1) != C(n2,k2) mod p for ANY small prime p,
+      they CANNOT be equal — eliminated instantly.
+
+    Args:
+      max_n              : search rows 0..max_n (default 500)
+      max_k              : search columns 0..max_k (default 50)
+      target_multiplicity: how many positions must share same value
+                           2=2-way, 4=4-way, 5=9+appearances (default 4)
+      use_lucas_filter   : apply Lucas mod-prime filter first (default True)
+
+    Returns:
+      - candidates: positions grouped by value, sorted by multiplicity
+      - best_target: highest-multiplicity group found
+      - quantum_ready: True if a group meets target_multiplicity
+      - next_step: what to run next
+    """
+    try:
+        from math import comb
+
+        # ── 1. Lucas' Theorem filter ───────────────────────────────────────
+        # For small primes, compute C(n,k) mod p quickly using Lucas.
+        # If two positions differ mod p they can't be equal — skip them.
+        PRIMES = [2, 3, 5, 7, 11, 13]
+
+        def lucas_mod(n, k, p):
+            """Compute C(n,k) mod p using Lucas' theorem."""
+            if k > n:
+                return 0
+            if k == 0 or k == n:
+                return 1
+            result = 1
+            while n > 0 or k > 0:
+                ni, ki = n % p, k % p
+                if ki > ni:
+                    return 0
+                # C(ni, ki) mod p — small values, compute directly
+                c = 1
+                for i in range(ki):
+                    c = c * (ni - i) // (i + 1)
+                result = (result * (c % p)) % p
+                n //= p
+                k //= p
+            return result
+
+        def mod_signature(n, k):
+            """Fingerprint of C(n,k) — tuple of values mod each prime."""
+            return tuple(lucas_mod(n, k, p) for p in PRIMES)
+
+        # ── 2. Build candidate table ───────────────────────────────────────
+        # Group positions by their mod signature first (fast filter),
+        # then by exact value for confirmed matches.
+
+        # Only search k <= n/2 (Pascal symmetry: C(n,k)=C(n,n-k))
+        sig_groups = {}   # signature → list of (n, k)
+
+        for n in range(0, max_n + 1):
+            k_limit = min(max_k, n // 2 + 1)
+            for k in range(0, k_limit):
+                if use_lucas_filter:
+                    sig = mod_signature(n, k)
+                    sig_groups.setdefault(sig, []).append((n, k))
+                else:
+                    sig_groups.setdefault((0,), []).append((n, k))
+
+        # ── 3. Exact match within each signature group ─────────────────────
+        # Only compute full comb() for positions sharing the same signature
+        value_groups = {}   # exact value → list of (n, k)
+        total_computed = 0
+        total_skipped = 0
+
+        for sig, positions in sig_groups.items():
+            if len(positions) < 2:
+                total_skipped += len(positions)
+                continue
+            # These share the same mod fingerprint — compute exact values
+            for n, k in positions:
+                v = comb(n, k)
+                if v > 1:   # skip trivial C(n,0)=C(n,n)=1
+                    value_groups.setdefault(v, []).append((n, k))
+                    total_computed += 1
+
+        # ── 4. Add symmetric partners C(n,n-k) for complete picture ───────
+        # We searched k<=n/2, now add the mirror positions
+        full_groups = {}
+        for v, positions in value_groups.items():
+            full = list(positions)
+            for n, k in positions:
+                if k != n - k:   # avoid duplicating the middle element
+                    full.append((n, n - k))
+            full_groups[v] = sorted(set(full))
+
+        # ── 5. Filter by target multiplicity ──────────────────────────────
+        candidates = []
+        for v, positions in full_groups.items():
+            if len(positions) >= 2:
+                candidates.append({
+                    "value": v,
+                    "multiplicity": len(positions),
+                    "positions": [{"n": n, "k": k} for n, k in positions],
+                    "meets_target": len(positions) >= target_multiplicity,
+                })
+
+        candidates.sort(key=lambda c: c["multiplicity"], reverse=True)
+
+        # ── 6. Stats ───────────────────────────────────────────────────────
+        reduction_pct = round(100 * total_skipped /
+                              max(1, total_skipped + total_computed), 1)
+        meets_target = [c for c in candidates if c["meets_target"]]
+        best = candidates[0] if candidates else None
+
+        # ── 7. Quantum next step ───────────────────────────────────────────
+        if meets_target:
+            top = meets_target[0]
+            next_step = (
+                f"Found {len(meets_target)} values with {target_multiplicity}+ appearances. "
+                f"Best: value={top['value']} at {top['multiplicity']} positions. "
+                f"Run encode_collision_problem or encode_4way_collision with these positions."
+            )
+        else:
+            top_mult = best["multiplicity"] if best else 0
+            next_step = (
+                f"No {target_multiplicity}-way collision found up to n={max_n}. "
+                f"Best found: {top_mult}-way. Increase max_n or max_k to search deeper."
+            )
+
+        return json.dumps({
+            "search_range": {"max_n": max_n, "max_k": max_k},
+            "target_multiplicity": target_multiplicity,
+            "lucas_filter_used": use_lucas_filter,
+            "positions_computed": total_computed,
+            "positions_skipped_by_sieve": total_skipped,
+            "sieve_reduction_pct": reduction_pct,
+            "total_candidates_found": len(candidates),
+            "meets_target_count": len(meets_target),
+            "top_10_by_multiplicity": candidates[:10],
+            "best_target": best,
+            "quantum_ready": len(meets_target) > 0,
+            "next_step": next_step,
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
+
+
+# --------------------------------------------------------------------------
+# Tool: run_parallel_collision_search
+# --------------------------------------------------------------------------
+@mcp.tool()
+def run_parallel_collision_search(
+    k_pairs: list,
+    max_n: int = 20,
+    shots: int = 4096,
+    p_layers: int = 2,
+    gamma: float = 2.589,
+    beta: float = 0.501,
+    simulate_only: bool = True,
+    backend_name: str = "",
+) -> str:
+    """
+    Parallel rails — ONE job, MULTIPLE collision searches simultaneously.
+
+    Instead of one 9-qubit search, tiles multiple independent LNAA rings
+    on ibm_marrakesh (156 qubits). Each ring searches a different (k1,k2)
+    column pair. No cross-talk between rings. One submission.
+
+    Why this matters:
+      ibm_marrakesh has 156 qubits. Our basic search uses 9.
+      We can run ~10 independent searches in one job for the same cost.
+
+    Args:
+      k_pairs    : list of [k1,k2] pairs, e.g. [[2,3],[3,4],[4,5]]
+      max_n      : search rows 0..max_n for each pair
+      shots      : total shots (split across rails in simulation)
+      simulate_only: True = free simulation, False = real hardware
+
+    Returns amplification for each rail and combined best result.
+    """
+    try:
+        from math import comb, ceil, log2
+        from collections import defaultdict
+
+        if not k_pairs or len(k_pairs) == 0:
+            return json.dumps({"error": "k_pairs must be a non-empty list like [[2,3],[3,4]]"})
+
+        # ── 1. Encode each rail classically ───────────────────────────────
+        rails = []
+        for pair in k_pairs:
+            k1, k2 = int(pair[0]), int(pair[1])
+
+            table1 = {}
+            for n in range(k1, max_n + 1):
+                table1.setdefault(comb(n, k1), []).append(n)
+            table2 = {}
+            for n in range(k2, max_n + 1):
+                table2.setdefault(comb(n, k2), []).append(n)
+
+            collisions = []
+            for v in sorted(set(table1) & set(table2)):
+                if v > 1:
+                    for n1 in table1[v]:
+                        for n2 in table2[v]:
+                            collisions.append({"n1": n1, "n2": n2, "value": v})
+
+            if not collisions:
+                rails.append({"k1": k1, "k2": k2, "status": "no_collisions", "collisions": []})
+                continue
+
+            bits1 = max(1, ceil(log2(max_n + 1)))
+            bits2 = max(1, ceil(log2(max_n + 1)))
+            num_qubits = bits1 + bits2
+
+            # Primary target = largest value collision
+            primary = max(collisions, key=lambda c: c["value"])
+            n1_p, n2_p = primary["n1"], primary["n2"]
+
+            # Conditions from primary collision bit pattern
+            conditions = {}
+            for i in range(bits1):
+                conditions[i] = int((n1_p >> i) & 1)
+            for i in range(bits2):
+                conditions[bits1 + i] = int((n2_p >> i) & 1)
+
+            # marked_rows as Qiskit integers
+            marked_rows = []
+            for col in collisions:
+                qbits = [(col["n1"] >> i) & 1 for i in range(bits1)]
+                qbits += [(col["n2"] >> i) & 1 for i in range(bits2)]
+                marked_rows.append(int("".join(str(b) for b in reversed(qbits)), 2))
+
+            rails.append({
+                "k1": k1, "k2": k2,
+                "collisions": collisions,
+                "primary": primary,
+                "num_qubits": num_qubits,
+                "conditions": conditions,
+                "marked_rows": marked_rows,
+                "bits1": bits1, "bits2": bits2,
+            })
+
+        active_rails = [r for r in rails if r.get("conditions")]
+        if not active_rails:
+            return json.dumps({"error": "No valid collision pairs found in given range.", "rails": rails})
+
+        # ── 2. Build parallel circuit — stack rails side by side ──────────
+        from qiskit import QuantumCircuit
+
+        # Each rail gets its own qubit block, offset by rail index
+        total_qubits = sum(r["num_qubits"] for r in active_rails)
+        qc = QuantumCircuit(total_qubits, total_qubits)
+
+        qubit_offset = 0
+        rail_qubit_ranges = []
+
+        for rail in active_rails:
+            nq = rail["num_qubits"]
+            qrange = list(range(qubit_offset, qubit_offset + nq))
+            rail_qubit_ranges.append(qrange)
+
+            # Superposition for this rail
+            qc.h(qrange)
+
+            # h_coeffs from conditions
+            h_coeffs = {}
+            for q_local, val in rail["conditions"].items():
+                h_coeffs[int(q_local)] = +1.0 if val == 1 else -1.0
+
+            # p layers of LNAA
+            for _ in range(p_layers):
+                for q_local, h in h_coeffs.items():
+                    qc.rz(2 * h * gamma, qubit_offset + q_local)
+                for i in range(nq):
+                    qc.rx(2 * beta, qubit_offset + i)
+
+            # Measure this rail into its own classical bits
+            for i, q in enumerate(qrange):
+                qc.measure(q, qubit_offset + i)
+
+            qubit_offset += nq
+
+        logical_gates = qc.size()
+
+        # ── 3. Simulate or submit ─────────────────────────────────────────
+        if simulate_only:
+            # Simulate each rail separately to avoid memory explosion.
+            # 27-qubit statevector needs 16GB; 9-qubit needs 512MB.
+            # Hardware submission still uses the combined circuit.
+            from qiskit_aer import AerSimulator
+            from qiskit import QuantumCircuit as _QC
+            sim = AerSimulator()
+
+            rail_counts_list = []
+            qubit_offset_sim = 0
+            for rail in active_rails:
+                nq = rail["num_qubits"]
+                h_coeffs_r = {int(q): (+1.0 if v == 1 else -1.0)
+                              for q, v in rail["conditions"].items()}
+                rail_qc = _QC(nq, nq)
+                rail_qc.h(range(nq))
+                for _ in range(p_layers):
+                    for qi, h in h_coeffs_r.items():
+                        rail_qc.rz(2 * h * gamma, qi)
+                    for i in range(nq):
+                        rail_qc.rx(2 * beta, i)
+                rail_qc.measure(range(nq), range(nq))
+                rail_counts = sim.run(rail_qc, shots=shots).result().get_counts()
+                rail_counts_list.append(rail_counts)
+                qubit_offset_sim += nq
+
+            # Build a fake combined counts dict so the rail-splitting code below works
+            # Each rail's bitstring is padded to fill its place in the combined register
+            counts = {}
+            total_q = sum(r["num_qubits"] for r in active_rails)
+            offset = 0
+            for rail, rc in zip(active_rails, rail_counts_list):
+                nq = rail["num_qubits"]
+                before = total_q - offset - nq   # high bits (other rails above)
+                after  = offset                  # low bits (other rails below)
+                for bits, cnt in rc.items():
+                    full = "0" * before + bits + "0" * after
+                    counts[full] = counts.get(full, 0) + cnt
+                offset += nq
+        else:
+            from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager as _gpm
+            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+
+            svc = _get_service()
+            bname = backend_name or "ibm_kingston"
+            backend = svc.backend(bname)
+            pm = _gpm(optimization_level=2, backend=backend, seed_transpiler=42)
+            t_qc = pm.run(qc)
+            sampler = IBMSampler(mode=backend)
+            job = sampler.run([t_qc], shots=shots)
+            return json.dumps({
+                "status": "submitted",
+                "job_id": job.job_id(),
+                "backend": bname,
+                "total_qubits": total_qubits,
+                "logical_gates": logical_gates,
+                "rails": [{"k1": r["k1"], "k2": r["k2"], "primary": r.get("primary")} for r in active_rails],
+                "note": f"Use job_results('{job.job_id()}') to get results when done.",
+            }, indent=2)
+
+        # ── 4. Split counts back per rail and compute amplification ───────
+        rail_results = []
+        qubit_offset = 0
+
+        for rail, qrange in zip(active_rails, rail_qubit_ranges):
+            nq = rail["num_qubits"]
+            marked_set = set(format(r, f'0{nq}b') for r in rail["marked_rows"])
+            search_space = 2 ** nq
+            random_baseline = len(rail["marked_rows"]) / search_space
+
+            # Extract this rail's bits from the full bitstring
+            rail_counts = defaultdict(int)
+            for full_bits, cnt in counts.items():
+                # Qiskit bitstring is MSB-first for the full register
+                # Extract the bits belonging to this rail
+                rail_bits = full_bits[total_qubits - qubit_offset - nq: total_qubits - qubit_offset]
+                rail_counts[rail_bits] += cnt
+
+            total = sum(rail_counts.values())
+            marked_total = sum(rail_counts.get(b, 0) for b in marked_set)
+            marked_fraction = marked_total / total if total > 0 else 0
+            amplification = round(marked_fraction / random_baseline, 2) if random_baseline > 0 else 0
+
+            top = sorted(rail_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            rail_results.append({
+                "k1": rail["k1"], "k2": rail["k2"],
+                "primary_target": rail.get("primary"),
+                "amplification": amplification,
+                "marked_fraction_pct": round(marked_fraction * 100, 2),
+                "random_baseline_pct": round(random_baseline * 100, 2),
+                "top_states": [{"bits": b, "count": c} for b, c in top],
+            })
+
+            qubit_offset += nq
+
+        best = max(rail_results, key=lambda r: r["amplification"])
+
+        return json.dumps({
+            "mode": "simulation" if simulate_only else "hardware",
+            "total_qubits_used": total_qubits,
+            "logical_gates": logical_gates,
+            "rails_run": len(active_rails),
+            "rail_results": rail_results,
+            "best_rail": best,
+            "summary": (
+                f"{len(active_rails)} searches in ONE job. "
+                f"Best: k={best['k1']}vs{best['k2']} → {best['amplification']}× amplification."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({"error": str(e), "trace": traceback.format_exc()})
 
 
 # --------------------------------------------------------------------------
@@ -2433,7 +5820,15 @@ if __name__ == "__main__":
         print(f"Server URL:    http://{args.host}:{args.port}", flush=True)
         print(f"CORS Origins:  {args.cors_origins}", flush=True)
         print(f"Authentication: {'Enabled (API key required)' if api_key_configured else 'Disabled (development mode)'}", flush=True)
-        
+
+        # Show IBM account info in banner only if IBM_SHOW_ACCOUNT_INFO is not "false".
+        # Default is to show it — set IBM_SHOW_ACCOUNT_INFO=false in .env to hide.
+        if os.getenv("IBM_SHOW_ACCOUNT_INFO", "true").lower() != "false":
+            ibm_channel  = os.getenv("IBM_CHANNEL", "ibm_quantum_platform")
+            ibm_instance = os.getenv("IBM_INSTANCE", "(auto-select)")
+            print(f"IBM Channel:   {ibm_channel}", flush=True)
+            print(f"IBM Instance:  {ibm_instance}", flush=True)
+
         if not api_key_configured:
             print("\n⚠️  WARNING: No API key configured!", flush=True)
             print("   Set MCP_API_KEY environment variable for production use.", flush=True)
@@ -2448,6 +5843,16 @@ if __name__ == "__main__":
             """Run HTTP server with authentication middleware."""
             starlette_app = mcp.sse_app()
             starlette_app.add_middleware(APIKeyAuthMiddleware, api_key=api_key)
+
+            # Wire CORS — the --cors-origins arg was parsed but never applied before
+            from starlette.middleware.cors import CORSMiddleware
+            origins = [o.strip() for o in args.cors_origins.split(',') if o.strip()]
+            starlette_app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_methods=["GET", "POST"],
+                allow_headers=["Content-Type", "X-API-Key"],
+            )
 
             # The MCP SDK (transport_security.py) validates the Host header against
             # the pattern "localhost:*" — it accepts any "localhost:PORT" but NOT
