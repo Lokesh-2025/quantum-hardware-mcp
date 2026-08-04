@@ -3320,9 +3320,9 @@ def estimate_ionq_cost(qasm_circuits: list, shots: int = 4096) -> str:
         from qiskit import QuantumCircuit as QC, transpile
         from qiskit_ionq import IonQProvider
 
-        # forte-1's real target — this is what your $3,000 grant actually
-        # targets. Transpiling against the generic simulator target instead
-        # would silently give MS-based (Aria-style) counts, not ZZ.
+        # forte-1's real target. Transpiling against the generic simulator
+        # target instead would silently give MS-based (Aria-style) counts,
+        # not ZZ — Forte doesn't have MS at all.
         backend = IonQProvider(api_key).get_backend("qpu.forte-1", gateset="native")
 
         per_circuit = []
