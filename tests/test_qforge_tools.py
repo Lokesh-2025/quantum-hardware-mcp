@@ -102,6 +102,31 @@ def test_plan_reports_when_nothing_fits():
     assert result["warning"]
 
 
+def test_plan_does_not_promise_accuracy_it_cannot_deliver():
+    """The per-option accuracy flag must be named for what it measures.
+
+    It compares the CLASSICAL truncation floor against 1.0 kcal/mol and knows
+    nothing about hardware noise. Measured H4 runs came back 125-135 kcal/mol
+    off while this floor sat at 0.57, so a field called
+    "reaches_chemical_accuracy" would be wrong by two orders of magnitude.
+    """
+    result = call(tools_chemistry.plan_quantum_chemistry_run, H4, 4, 10000.0)
+    for option in result["options"]:
+        assert "reaches_chemical_accuracy" not in option
+        assert isinstance(option["classical_floor_below_chemical_accuracy"], bool)
+        assert option["classical_floor_below_chemical_accuracy"] == (
+            option["accuracy_floor_kcal_mol"] <= 1.0
+        )
+    # and the caveat has to travel with the numbers
+    assert "noiseless" in result["accuracy_assumptions"]
+
+
+def test_plan_requires_an_explicit_budget():
+    """No default budget: a guessed one recommends what you cannot buy."""
+    with pytest.raises(TypeError):
+        tools_chemistry.plan_quantum_chemistry_run(H4, 4)
+
+
 def test_plan_uses_the_real_gauge_circuit_count():
     """Circuits = (rank + 2*pairs) x bases.
 

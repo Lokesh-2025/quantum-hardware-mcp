@@ -169,7 +169,7 @@ def analyze_molecule(atoms: str, n_electrons: int) -> str:
 
 @mcp.tool()
 def plan_quantum_chemistry_run(atoms: str, n_electrons: int,
-                               budget_usd: float = 10000.0,
+                               budget_usd: float,
                                price_per_circuit: float = 25.79) -> str:
     """
     Given a molecule and a budget, recommend how to actually run it.
@@ -181,7 +181,9 @@ def plan_quantum_chemistry_run(atoms: str, n_electrons: int,
     Args:
         atoms: geometry in Angstrom, e.g. "H 0 0 0; H 0 0 0.74"
         n_electrons: total electrons
-        budget_usd: available credits (default 10000)
+        budget_usd: available credits, in dollars. Required -- there is no
+            sensible default, and guessing one produces confident
+            recommendations the caller cannot actually afford.
         price_per_circuit: hardware price per circuit. 25.79 is IonQ Forte's
             measured per-circuit floor for shallow circuits; check current
             rates rather than trusting this default.
@@ -222,7 +224,13 @@ def plan_quantum_chemistry_run(atoms: str, n_electrons: int,
                 "estimated_cost_usd": round(cost, 2),
                 "accuracy_floor_kcal_mol": round(abs(approx - energy) * 627.5094740631, 4),
                 "fits_budget": bool(cost <= budget_usd),
-                "reaches_chemical_accuracy": bool(
+                # NOT a prediction that a real run lands within chemical
+                # accuracy. This compares the CLASSICAL truncation floor
+                # against 1.0 kcal/mol and ignores hardware noise entirely.
+                # Measured H4 runs on IonQ came back 125-135 kcal/mol off
+                # while this floor sat at 0.57, so the two differ by more
+                # than two orders of magnitude. Named for what it measures.
+                "classical_floor_below_chemical_accuracy": bool(
                     abs(approx - energy) * 627.5094740631 <= 1.0
                 ),
             })
@@ -256,6 +264,15 @@ def plan_quantum_chemistry_run(atoms: str, n_electrons: int,
                 "two-qubit gates on IonQ Forte). Zero-noise extrapolation folds "
                 "circuits and typically pushes past that, costing several times "
                 "more -- price ZNE separately with real folded gate counts."
+            ),
+            "accuracy_assumptions": (
+                "accuracy_floor_kcal_mol is the CLASSICAL Schmidt-truncation "
+                "error only. It is a floor, not a forecast: it assumes a "
+                "noiseless device. Real hardware adds error on top, and on H4 "
+                "that gap was measured at 125-135 kcal/mol against a 0.57 "
+                "floor. Use recommend_error_mitigation and "
+                "estimate_circuit_error_ceiling to bound the noise term before "
+                "reading any of these floors as an achievable result."
             ),
         }, indent=2)
     except Exception as e:
