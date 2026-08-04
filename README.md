@@ -70,7 +70,7 @@ graph TD
     end
 
     subgraph Execution Plane
-        MCP["MCP Server\nserver.py\n34 tools"]
+        MCP["MCP Server\nserver.py\n50 tools"]
         IBMAPI["IBM Quantum API\nQiskit Runtime"]
         IonQAPI["IonQ REST API"]
         BraketAPI["AWS Braket API"]
@@ -126,7 +126,7 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 
 ---
 
-## Tools (47 total)
+## Tools (50 total)
 
 ### Device intelligence
 
@@ -245,9 +245,12 @@ rest of the server still runs if it is missing.
 | Tool | What it does |
 |------|-------------|
 | `ionq_devices` | All IonQ backends and simulators with live status |
-| `ionq_submit_job` | Submit OpenQASM 2.0/3.0 to IonQ hardware or simulator |
-| `ionq_job_status` | Job status on IonQ |
-| `ionq_job_results` | Measurement counts from a completed IonQ job |
+| `ionq_submit_job` | Submit one or more circuits to IonQ as a single batched job — pre-flight self-check on the free simulator (with the real target device's noise model applied) runs before anything real is billed; refuses to submit if simulated results don't match an expected prediction |
+| `ionq_job_status` | Job status on IonQ, with `is_real_hardware` always reported explicitly |
+| `ionq_job_results` | Measurement counts from a completed IonQ job (single or batched), with `is_real_hardware` — never guessed, set from the backend name itself |
+| `estimate_ionq_gates` | Native gate count (GPI/GPI2/ZZ) for a circuit before submitting, transpiled against a real device's actual native target — Forte-class hardware uses ZZ, not Mølmer-Sørensen (that's Aria-only, and Aria is retired) |
+| `estimate_ionq_cost` | Dollar cost preview using IonQ's real per-job pricing floor, verified against IonQ's own resource estimator |
+| `certify_ising_gate_optimality` | Proves — not estimates — the minimum two-qubit gate count for an Ising Hamiltonian's native compilation. Validated against this project's own entangling circuits: exactly reproduces their known gate counts and confirms they're provably optimal |
 
 ---
 
@@ -303,7 +306,7 @@ python tests/test_all_tools.py
 
 ```
 quantum-hardware-mcp/
-├── server.py                      # MCP server — 34 tools
+├── server.py                      # MCP server — 50 tools
 ├── snapshot.py                    # Multi-provider calibration snapshot (every 2h)
 ├── report.py                      # Daily fleet report
 ├── requirements.txt
@@ -367,7 +370,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. All 34 tools appear under the hammer icon.
+Restart Claude Desktop. All 50 tools appear under the hammer icon.
 
 ---
 
