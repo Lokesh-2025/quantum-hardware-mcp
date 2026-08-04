@@ -1,12 +1,12 @@
 """
-Tests for the qforge MCP tools exposed by server.py.
+Tests for the qforge MCP tools, defined in tools_chemistry.py.
 
 These verify the INTEGRATION -- that the library is actually reachable as MCP
 tools and returns well-formed JSON -- as distinct from tests/test_qforge.py,
 which tests the library itself.
 
 Every tool returns a JSON string (the convention used by the other tools in
-server.py), so each test parses the payload and checks its contents rather
+tools_chemistry.py), so each test parses the payload and checks its contents rather
 than just checking the call did not raise.
 
 No hardware, no network, no IBM credentials required.
@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-import server
+import tools_chemistry
 
 H2 = "H 0 0 0; H 0 0 0.74"
 H4 = "H 0 0 0; H 1 0 0; H 2 0 0; H 3 0 0"
@@ -35,14 +35,14 @@ def call(tool, *args, **kwargs):
 # ----------------------------------------------------------- analyze_molecule
 def test_analyze_molecule_h2_matches_reference():
     """H2 energy must match the PySCF-verified reference."""
-    result = call(server.analyze_molecule, H2, 2)
+    result = call(tools_chemistry.analyze_molecule, H2, 2)
     assert result["exact_energy_hartree"] == pytest.approx(-1.137284, abs=1e-5)
     assert result["qubits_direct"] == 4
     assert result["qubits_with_forging"] == 2
 
 
 def test_analyze_molecule_h4_matches_reference():
-    result = call(server.analyze_molecule, H4, 4)
+    result = call(tools_chemistry.analyze_molecule, H4, 4)
     assert result["exact_energy_hartree"] == pytest.approx(-2.166387, abs=1e-5)
     assert result["qubits_direct"] == 8
     assert result["hamiltonian_terms"] == 185
@@ -50,7 +50,7 @@ def test_analyze_molecule_h4_matches_reference():
 
 def test_general_grouping_beats_qubit_wise_through_the_tool():
     """The circuit saving must actually surface in the tool output."""
-    result = call(server.analyze_molecule, H4, 4)
+    result = call(tools_chemistry.analyze_molecule, H4, 4)
     assert (
         result["measurement_circuits_general_commuting"]
         < result["measurement_circuits_qubit_wise"]
@@ -60,14 +60,14 @@ def test_general_grouping_beats_qubit_wise_through_the_tool():
 def test_full_schmidt_rank_is_exact():
     """At full rank, forging has no truncation error -- a correctness check
     on the whole decompose/rebuild path."""
-    result = call(server.analyze_molecule, H2, 2)
+    result = call(tools_chemistry.analyze_molecule, H2, 2)
     floors = result["accuracy_floor_kcal_mol_by_rank"]
     assert floors[str(result["schmidt_rank"])] == pytest.approx(0.0, abs=1e-3)
 
 
 def test_accuracy_improves_with_rank():
     """Keeping more Schmidt terms must never make the answer worse."""
-    result = call(server.analyze_molecule, H4, 4)
+    result = call(tools_chemistry.analyze_molecule, H4, 4)
     floors = result["accuracy_floor_kcal_mol_by_rank"]
     ranks = sorted(int(k) for k in floors)
     errors = [floors[str(r)] for r in ranks]
@@ -76,7 +76,7 @@ def test_accuracy_improves_with_rank():
 
 # --------------------------------------------------- plan_quantum_chemistry_run
 def test_plan_recommends_the_most_accurate_affordable_option():
-    result = call(server.plan_quantum_chemistry_run, H4, 4, 3000.0)
+    result = call(tools_chemistry.plan_quantum_chemistry_run, H4, 4, 3000.0)
     recommended = result["recommended"]
     affordable = [o for o in result["options"] if o["fits_budget"]]
     assert recommended["fits_budget"]
@@ -86,8 +86,8 @@ def test_plan_recommends_the_most_accurate_affordable_option():
 
 
 def test_plan_respects_the_budget():
-    small = call(server.plan_quantum_chemistry_run, H4, 4, 200.0)
-    large = call(server.plan_quantum_chemistry_run, H4, 4, 10000.0)
+    small = call(tools_chemistry.plan_quantum_chemistry_run, H4, 4, 200.0)
+    large = call(tools_chemistry.plan_quantum_chemistry_run, H4, 4, 10000.0)
     # a bigger budget can only buy equal or better accuracy
     assert (
         large["recommended"]["accuracy_floor_kcal_mol"]
@@ -97,9 +97,34 @@ def test_plan_respects_the_budget():
 
 def test_plan_reports_when_nothing_fits():
     """An impossible budget must say so rather than recommend something."""
-    result = json.loads(server.plan_quantum_chemistry_run(H4, 4, 1.0))
+    result = json.loads(tools_chemistry.plan_quantum_chemistry_run(H4, 4, 1.0))
     assert result["recommended"] is None
     assert result["warning"]
+
+
+def test_plan_does_not_promise_accuracy_it_cannot_deliver():
+    """The per-option accuracy flag must be named for what it measures.
+
+    It compares the CLASSICAL truncation floor against 1.0 kcal/mol and knows
+    nothing about hardware noise. Measured H4 runs came back 125-135 kcal/mol
+    off while this floor sat at 0.57, so a field called
+    "reaches_chemical_accuracy" would be wrong by two orders of magnitude.
+    """
+    result = call(tools_chemistry.plan_quantum_chemistry_run, H4, 4, 10000.0)
+    for option in result["options"]:
+        assert "reaches_chemical_accuracy" not in option
+        assert isinstance(option["classical_floor_below_chemical_accuracy"], bool)
+        assert option["classical_floor_below_chemical_accuracy"] == (
+            option["accuracy_floor_kcal_mol"] <= 1.0
+        )
+    # and the caveat has to travel with the numbers
+    assert "noiseless" in result["accuracy_assumptions"]
+
+
+def test_plan_requires_an_explicit_budget():
+    """No default budget: a guessed one recommends what you cannot buy."""
+    with pytest.raises(TypeError):
+        tools_chemistry.plan_quantum_chemistry_run(H4, 4)
 
 
 def test_plan_uses_the_real_gauge_circuit_count():
@@ -109,7 +134,7 @@ def test_plan_uses_the_real_gauge_circuit_count():
     gauge the imaginary part is identically zero, so those circuits would
     measure only noise.
     """
-    result = call(server.plan_quantum_chemistry_run, H4, 4, 10000.0)
+    result = call(tools_chemistry.plan_quantum_chemistry_run, H4, 4, 10000.0)
     bases = result["molecule"]["measurement_bases"]
     for option in result["options"]:
         rank = option["schmidt_rank"]
@@ -121,15 +146,15 @@ def test_plan_uses_the_real_gauge_circuit_count():
 # ------------------------------------------------- recommend_error_mitigation
 def test_mitigation_advice_scales_with_noise():
     """A clean shallow circuit should not be told it needs ZNE."""
-    clean = call(server.recommend_error_mitigation, 2, 0.0002, 0.0, True)
-    noisy = call(server.recommend_error_mitigation, 55, 0.03, 0.0, True)
+    clean = call(tools_chemistry.recommend_error_mitigation, 2, 0.0002, 0.0, True)
+    noisy = call(tools_chemistry.recommend_error_mitigation, 55, 0.03, 0.0, True)
     assert "zero_noise_extrapolation" not in clean["apply_in_order"]
     assert "zero_noise_extrapolation" in noisy["apply_in_order"]
 
 
 def test_twirling_is_never_recommended():
     """A documented negative: no measured benefit against depolarising noise."""
-    result = call(server.recommend_error_mitigation, 11, 0.002, 0.02, True)
+    result = call(tools_chemistry.recommend_error_mitigation, 11, 0.002, 0.02, True)
     twirl = next(
         r for r in result["recommendations"] if r["technique"] == "pauli_twirling"
     )
@@ -138,36 +163,36 @@ def test_twirling_is_never_recommended():
 
 
 def test_symmetry_verification_requires_a_conserved_quantity():
-    with_symmetry = call(server.recommend_error_mitigation, 11, 0.002, 0.0, True)
-    without = call(server.recommend_error_mitigation, 11, 0.002, 0.0, False)
+    with_symmetry = call(tools_chemistry.recommend_error_mitigation, 11, 0.002, 0.0, True)
+    without = call(tools_chemistry.recommend_error_mitigation, 11, 0.002, 0.0, False)
     assert "symmetry_verification" in with_symmetry["apply_in_order"]
     assert "symmetry_verification" not in without["apply_in_order"]
 
 
 def test_readout_mitigation_only_when_readout_error_present():
-    none = call(server.recommend_error_mitigation, 11, 0.002, 0.0, True)
-    some = call(server.recommend_error_mitigation, 11, 0.002, 0.02, True)
+    none = call(tools_chemistry.recommend_error_mitigation, 11, 0.002, 0.0, True)
+    some = call(tools_chemistry.recommend_error_mitigation, 11, 0.002, 0.02, True)
     assert "readout_error_mitigation" not in none["apply_in_order"]
     assert "readout_error_mitigation" in some["apply_in_order"]
 
 
 # ------------------------------------------ estimate_circuit_error_ceiling
 def test_ceiling_grows_with_noise_and_depth():
-    low = call(server.estimate_circuit_error_ceiling, 11, 50, 0.002)
-    high = call(server.estimate_circuit_error_ceiling, 11, 50, 0.03)
-    deep = call(server.estimate_circuit_error_ceiling, 55, 50, 0.002)
+    low = call(tools_chemistry.estimate_circuit_error_ceiling, 11, 50, 0.002)
+    high = call(tools_chemistry.estimate_circuit_error_ceiling, 11, 50, 0.03)
+    deep = call(tools_chemistry.estimate_circuit_error_ceiling, 55, 50, 0.002)
     assert high["error_ceiling_any_observable"] > low["error_ceiling_any_observable"]
     assert deep["error_ceiling_any_observable"] > low["error_ceiling_any_observable"]
 
 
 def test_ceiling_reports_fidelity_between_zero_and_one():
-    result = call(server.estimate_circuit_error_ceiling, 11, 50, 0.002)
+    result = call(tools_chemistry.estimate_circuit_error_ceiling, 11, 50, 0.002)
     assert 0.0 <= result["estimated_fidelity"] <= 1.0
 
 
 # -------------------------------------------------------------- input handling
 def test_bad_geometry_returns_a_helpful_error():
-    result = json.loads(server.analyze_molecule("H 0 0", 2))
+    result = json.loads(tools_chemistry.analyze_molecule("H 0 0", 2))
     assert "error" in result
     assert "SYMBOL X Y Z" in result["error"]
 
@@ -175,14 +200,14 @@ def test_bad_geometry_returns_a_helpful_error():
 def test_oversized_system_is_refused_not_hung():
     """Exact diagonalisation is exponential; the guard must reject early."""
     chain = "; ".join(f"H {i} 0 0" for i in range(12))
-    result = json.loads(server.analyze_molecule(chain, 12))
+    result = json.loads(tools_chemistry.analyze_molecule(chain, 12))
     assert "error" in result
     assert "limit" in result["error"].lower()
 
 
 def test_geometry_accepts_newlines():
-    newline_form = call(server.analyze_molecule, "H 0 0 0\nH 0 0 0.74", 2)
-    semicolon_form = call(server.analyze_molecule, H2, 2)
+    newline_form = call(tools_chemistry.analyze_molecule, "H 0 0 0\nH 0 0 0.74", 2)
+    semicolon_form = call(tools_chemistry.analyze_molecule, H2, 2)
     assert (
         newline_form["exact_energy_hartree"] == semicolon_form["exact_energy_hartree"]
     )
@@ -193,7 +218,7 @@ def test_build_forged_circuits_emits_valid_qasm():
     """The whole point of these tools: real, parseable, runnable circuits."""
     from qiskit import QuantumCircuit
 
-    result = call(server.build_forged_circuits, H2, 2, 2)
+    result = call(tools_chemistry.build_forged_circuits, H2, 2, 2)
     assert result["qasm"], "no circuits emitted"
     assert len(result["qasm"]) == result["circuits"]
     for qasm in result["qasm"]:
@@ -203,19 +228,19 @@ def test_build_forged_circuits_emits_valid_qasm():
 
 def test_forged_circuits_use_half_the_qubits():
     """Entanglement forging's entire purpose."""
-    result = call(server.build_forged_circuits, H2, 2, 2)
+    result = call(tools_chemistry.build_forged_circuits, H2, 2, 2)
     assert result["molecule"]["qubits_per_circuit"] * 2 == result["molecule"]["qubits_direct"]
 
 
 def test_circuits_include_measurements():
     """A circuit without measurement returns nothing from hardware."""
-    result = call(server.build_forged_circuits, H2, 2, 2)
+    result = call(tools_chemistry.build_forged_circuits, H2, 2, 2)
     assert all("measure" in qasm for qasm in result["qasm"])
 
 
 def test_build_runs_a_self_check():
     """Circuits are replayed on a simulator before anyone spends queue time."""
-    result = call(server.build_forged_circuits, H2, 2, 2)
+    result = call(tools_chemistry.build_forged_circuits, H2, 2, 2)
     assert result["self_check"]["passed"] is True
     # rank 2 is exact for H2, so only shot noise should remain
     assert result["self_check"]["simulator_error_kcal_mol"] < 1.0
@@ -223,7 +248,7 @@ def test_build_runs_a_self_check():
 
 def test_build_refuses_to_exceed_the_circuit_cap():
     """Guard against silently generating hundreds of hardware jobs."""
-    result = json.loads(server.build_forged_circuits(H4, 4, 5, max_circuits=10))
+    result = json.loads(tools_chemistry.build_forged_circuits(H4, 4, 5, max_circuits=10))
     assert "error" in result
     assert result["circuits_required"] > 10
 
@@ -235,7 +260,7 @@ def test_run_refuses_before_submitting_anything_oversized():
     submission is never attempted and no credentials are needed.
     """
     result = json.loads(
-        server.run_forged_energy(H4, 4, "no_such_device", schmidt_rank=5,
+        tools_chemistry.run_forged_energy(H4, 4, "no_such_device", schmidt_rank=5,
                                  max_circuits=5)
     )
     assert "error" in result
@@ -244,7 +269,7 @@ def test_run_refuses_before_submitting_anything_oversized():
 
 def test_collect_rejects_a_mismatched_job_count():
     """Job IDs map positionally to circuits, so the count must match exactly."""
-    result = json.loads(server.collect_forged_energy(H2, 2, "job1,job2", 2))
+    result = json.loads(tools_chemistry.collect_forged_energy(H2, 2, "job1,job2", 2))
     assert "error" in result
     assert "job ID" in result["error"] or "job IDs" in result["error"]
 
@@ -252,6 +277,6 @@ def test_collect_rejects_a_mismatched_job_count():
 def test_full_rank_h2_circuits_are_exact_in_simulation():
     """End-to-end: rank 2 reconstructs H2 exactly, so the measurement
     reconstruction (Clifford frame, sign, beta-register signs) is correct."""
-    result = call(server.build_forged_circuits, H2, 2, 2)
+    result = call(tools_chemistry.build_forged_circuits, H2, 2, 2)
     assert result["accuracy_floor_kcal_mol"] == pytest.approx(0.0, abs=1e-3)
     assert result["self_check"]["simulator_error_kcal_mol"] < 0.5

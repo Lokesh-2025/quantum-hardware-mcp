@@ -70,7 +70,7 @@ graph TD
     end
 
     subgraph Execution Plane
-        MCP["MCP Server\nserver.py\n50 tools"]
+        MCP["MCP Server\nserver.py + tools_chemistry.py\n50 tools"]
         IBMAPI["IBM Quantum API\nQiskit Runtime"]
         IonQAPI["IonQ REST API"]
         BraketAPI["AWS Braket API"]
@@ -306,7 +306,10 @@ python tests/test_all_tools.py
 
 ```
 quantum-hardware-mcp/
-├── server.py                      # MCP server — 50 tools
+├── server.py                      # MCP server — IBM + IonQ hardware tools
+├── tools_chemistry.py             # qforge chemistry tools (7), registered on the same server
+├── mcp_app.py                     # Shared FastMCP instance, so both sides register on one server
+├── qforge/                        # Quantum chemistry library — integrals, forging, mitigation
 ├── snapshot.py                    # Multi-provider calibration snapshot (every 2h)
 ├── report.py                      # Daily fleet report
 ├── requirements.txt
@@ -329,7 +332,9 @@ quantum-hardware-mcp/
 │   ├── phase5_lnaa.py             # Phase 5 — LNAA, 27.78× amplification (RECORD)
 │   └── vqe_h2.py                  # VQE for H2 molecule ground state
 ├── tests/
-│   └── test_all_tools.py          # Smoke test suite
+│   ├── test_all_tools.py          # Smoke test suite
+│   ├── test_qforge.py             # qforge library unit tests
+│   └── test_qforge_tools.py       # Chemistry MCP tool tests
 ├── data/
 │   └── snapshots.csv              # Public calibration history (updated by CI every 2h)
 └── .github/workflows/
