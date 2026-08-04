@@ -324,17 +324,18 @@ quantum-hardware-mcp/
 │       ├── ibm-subagent.js        # IBM specialist
 │       └── ionq-subagent.js       # IonQ specialist
 ├── experiments/
-│   ├── singmasters_grover.py      # Phase 1 — Grover, target=6
-│   ├── singmasters_3003.py        # Phase 2 — Grover, target=3003, coherence limit
-│   ├── phase3_grover_v3.py        # Phase 3 v3 — 103 gates, 4.17×
-│   ├── phase4_grover_7q.py        # Phase 4 v1 — 7 qubits, row 78 found
-│   ├── phase4_grover_v2.py        # Phase 4 v2 — lossy oracle, routing failure discovered
-│   ├── phase5_lnaa.py             # Phase 5 — LNAA, 27.78× amplification (RECORD)
 │   └── vqe_h2.py                  # VQE for H2 molecule ground state
+│                                   # (Singmaster's Conjecture phase history moved to the
+│                                   #  private singmasters-conjecture repo — full journey,
+│                                   #  178.8× hardware result, and job IDs live there)
 ├── tests/
-│   ├── test_all_tools.py          # Smoke test suite
+│   ├── test_all_tools.py          # Smoke test suite (needs live IBM credentials)
+│   ├── test_server_tools.py       # IBM + IonQ device/job tool tests
+│   ├── test_ionq_canaries.py      # Endianness + angle-unit regression tests (IonQ)
 │   ├── test_qforge.py             # qforge library unit tests
-│   └── test_qforge_tools.py       # Chemistry MCP tool tests
+│   ├── test_qforge_tools.py       # Chemistry MCP tool tests
+│   ├── test_agent_routing.py      # Dispatcher routing tests
+│   └── test_dispatcher.py         # Dispatcher unit tests
 ├── data/
 │   └── snapshots.csv              # Public calibration history (updated by CI every 2h)
 └── .github/workflows/
