@@ -1,6 +1,6 @@
 # Quantum Hardware MCP Server
 
-A production MCP server that gives AI assistants programmatic access to live quantum hardware across IBM Quantum, IonQ, and AWS Braket. Natural language in. Real quantum results out. No dashboards. No manual API calls.
+A quantum hardware orchestration and intelligence layer that gives AI agents the ability to select, validate, execute, and analyze quantum experiments across multiple providers. Natural language in. Real quantum results out. No dashboards. No manual API calls.
 
 Built in collaboration with [Jack Woehr](https://github.com/jwoehr) — IBM Quantum veteran, Qiskit contributor.
 
