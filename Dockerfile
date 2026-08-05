@@ -7,7 +7,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy only the files the server needs at runtime
-COPY server.py snapshot.py .env.example ./
+COPY server.py mcp_app.py tools_chemistry.py snapshot.py .env.example ./
+COPY qforge/ ./qforge/
 
 # IBM_QUANTUM_TOKEN must be passed at runtime via -e or --env-file
 # Never bake secrets into the image
