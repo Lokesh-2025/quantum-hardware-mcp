@@ -2271,14 +2271,27 @@ def ionq_submit_job(
                         the qiskit default of 2 does aggressive re-synthesis
                         that can rewrite a hand-designed circuit — don't raise
                         this without a specific reason.
-        expected_marked_bitstrings : optional, target bitstrings for the
-                        self-check (same convention as get_amplification)
-        expected_amplification    : optional, the ideal/simulator-predicted
-                        amplification this circuit should hit. If provided,
-                        the self-check enforces it before real submission.
-        amplification_tolerance   : relative tolerance for the self-check
-                        (default 0.5 = simulated amplification must be within
-                        50% of expected_amplification)
+        expected_marked_bitstrings : optional target bitstrings for the
+                        self-check (same convention as get_amplification).
+                        For ONE circuit: a flat list of bitstrings, e.g.
+                        ["0001110", "0001111"]. For a BATCH of N circuits:
+                        a list of N entries, one per circuit in the same
+                        order as qasm_circuits — each entry either a list
+                        of bitstrings for that circuit, or None to skip the
+                        check for that particular circuit.
+        expected_amplification    : optional predicted amplification each
+                        circuit should hit. For ONE circuit: a single number.
+                        For a BATCH: a list of N numbers/None, one per
+                        circuit, same order and same skip-with-None rule as
+                        expected_marked_bitstrings. Every circuit with both
+                        an expected_marked_bitstrings entry and an
+                        expected_amplification entry gets its own
+                        independent tolerance check — one bad circuit in a
+                        batch refuses the WHOLE submission, not just itself.
+        amplification_tolerance   : relative tolerance applied to every
+                        circuit's check (default 0.5 = simulated
+                        amplification must be within 50% of its own
+                        expected_amplification)
         confirm_real_hardware : must be True to submit to actual QPU hardware.
                         Not required for the simulator.
 
@@ -2314,6 +2327,33 @@ def ionq_submit_job(
 
         resolved_backend = _resolve_ionq_backend(backend_name)
         is_hardware = _ionq_is_hardware(resolved_backend)
+
+        # Normalize expected_marked_bitstrings / expected_amplification to
+        # one entry per circuit. Single-circuit calls may pass a flat value
+        # (backward compatible); batches of N>1 must pass a list of length N
+        # (use None per-entry to skip that circuit's check) — a flat value
+        # for a multi-circuit batch is ambiguous and rejected outright
+        # rather than silently applied to only circuit 0.
+        n_circuits = len(circuits)
+
+        def _per_circuit(value, param_name):
+            if value is None:
+                return [None] * n_circuits
+            if n_circuits == 1:
+                return [value]
+            if not isinstance(value, list) or len(value) != n_circuits:
+                raise ValueError(
+                    f"{param_name}: submitting {n_circuits} circuits requires a list of "
+                    f"{n_circuits} entries (one per circuit, None to skip that circuit's "
+                    f"check) — got {value!r}"
+                )
+            return value
+
+        try:
+            marked_per_circuit = _per_circuit(expected_marked_bitstrings, "expected_marked_bitstrings")
+            expected_amp_per_circuit = _per_circuit(expected_amplification, "expected_amplification")
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
 
         provider = IonQProvider(api_key)
 
@@ -2354,16 +2394,19 @@ def ionq_submit_job(
                 "simulated_counts_top5": dict(sorted(sim_counts.items(), key=lambda x: -x[1])[:5]),
             }
 
-            if expected_marked_bitstrings and len(qasm_circuits) == 1:
-                marked = set(expected_marked_bitstrings)
+            circuit_marked = marked_per_circuit[i]
+            circuit_expected_amp = expected_amp_per_circuit[i]
+
+            if circuit_marked:
+                marked = set(circuit_marked)
                 marked_shots = sum(c for b, c in sim_counts.items() if b in marked)
                 sim_amp = (marked_shots / total) / (len(marked) / (2 ** qc.num_qubits)) if total else 0
                 entry["simulated_amplification"] = round(sim_amp, 3)
 
-                if expected_amplification is not None:
-                    lo = expected_amplification * (1 - amplification_tolerance)
-                    hi = expected_amplification * (1 + amplification_tolerance)
-                    entry["expected_amplification"] = expected_amplification
+                if circuit_expected_amp is not None:
+                    lo = circuit_expected_amp * (1 - amplification_tolerance)
+                    hi = circuit_expected_amp * (1 + amplification_tolerance)
+                    entry["expected_amplification"] = circuit_expected_amp
                     entry["within_tolerance"] = lo <= sim_amp <= hi
                     if not entry["within_tolerance"]:
                         self_check["passed"] = False
@@ -2371,9 +2414,11 @@ def ionq_submit_job(
             self_check["per_circuit"].append(entry)
 
         if not self_check["passed"]:
+            failed_indices = [e["circuit_index"] for e in self_check["per_circuit"]
+                               if e.get("within_tolerance") is False]
             return json.dumps({
-                "error": "Self-check failed — simulated result does not match expected_amplification within tolerance",
-                "hint": "The circuit may have been rewritten by transpilation, or the expected value is wrong. Submission refused.",
+                "error": f"Self-check failed on circuit(s) {failed_indices} — simulated result does not match expected_amplification within tolerance",
+                "hint": "One bad circuit refuses the WHOLE batch — none of them submitted. The circuit may have been rewritten by transpilation, or the expected value is wrong.",
                 "self_check": self_check,
             })
 
