@@ -51,7 +51,7 @@ import requests
 import contextvars
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 from qiskit import QuantumCircuit
@@ -2238,8 +2238,8 @@ def ionq_submit_job(
     qasm_circuits: list,
     shots: int = 1024,
     optimization_level: int = 1,
-    expected_marked_bitstrings: list = None,
-    expected_amplification: float = None,
+    expected_marked_bitstrings: Union[list, None] = None,
+    expected_amplification: Union[float, list, None] = None,
     amplification_tolerance: float = 0.5,
     confirm_real_hardware: bool = False,
 ) -> str:
