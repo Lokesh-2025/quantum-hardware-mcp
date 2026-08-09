@@ -50,7 +50,7 @@ Important honesty note: the sieve (classical, microseconds) finds *which* rows c
 | Provider | Backends | Access |
 |----------|----------|--------|
 | IBM Quantum | 3 QPUs (ibm_torino 133q, ibm_marrakesh 156q, ibm_fez 156q) | API token |
-| IonQ | 6 registered (Harmony + both Aria retired; both Forte currently unavailable pending access; simulator active) | API key |
+| IonQ | 6 registered (Harmony + both Aria retired; Forte-1 and Forte-Enterprise-1 available; simulator active) | API key |
 | AWS Braket | 10 (QuEra Aquila 256q, IonQ via Braket, Rigetti via Braket, simulators) | IAM credentials |
 
 All 19 are polled every 2 hours. The dataset grows continuously — ML routing recommendations are planned once 60+ days of data accumulate.
@@ -245,7 +245,7 @@ rest of the server still runs if it is missing.
 | Tool | What it does |
 |------|-------------|
 | `ionq_devices` | All IonQ backends and simulators with live status |
-| `ionq_submit_job` | Submit one or more circuits to IonQ as a single batched job — pre-flight self-check on the free simulator (with the real target device's noise model applied) runs before anything real is billed; refuses to submit if simulated results don't match an expected prediction |
+| `ionq_submit_job` | Submit one or more circuits to IonQ as a single batched job — pre-flight self-check on the free simulator (with the real target device's noise model applied) runs before anything real is billed; each circuit in a batch can carry its own expected-amplification prediction, and one bad circuit refuses the whole batch, not just itself |
 | `ionq_job_status` | Job status on IonQ, with `is_real_hardware` always reported explicitly |
 | `ionq_job_results` | Measurement counts from a completed IonQ job (single or batched), with `is_real_hardware` — never guessed, set from the backend name itself |
 | `estimate_ionq_gates` | Native gate count (GPI/GPI2/ZZ) for a circuit before submitting, transpiled against a real device's actual native target — Forte-class hardware uses ZZ, not Mølmer-Sørensen (that's Aria-only, and Aria is retired) |
@@ -295,10 +295,14 @@ was_preflight_checked · was_ai_corrected · day_of_week · hour_utc
 ## Test suite
 
 ```bash
-python tests/test_all_tools.py
+pytest tests/ --ignore=tests/test_all_tools.py
 ```
 
-28 checks across all tools. Read-only tools hit the real IBM and IonQ APIs. Write tools are tested against validation paths only — zero QPU credits spent.
+92 passing — device tools, IonQ endianness/angle-unit canaries, qforge chemistry (library + MCP integration), dispatcher unit tests. No QPU credits spent; IonQ checks run against the free simulator, including realistic per-device noise-model previews.
+
+`test_all_tools.py` is a separate live-hardware smoke test — needs real IBM/IonQ credentials configured, run it directly rather than through `pytest`.
+
+`test_agent_routing.py` needs the Docker `agent` service running and reachable at `localhost:3021` — currently failing in this environment (known issue, not yet root-caused; unrelated to the MCP server tools themselves).
 
 ---
 
