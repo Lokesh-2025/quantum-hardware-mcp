@@ -2426,7 +2426,15 @@ def ionq_submit_job(
         # with its noise model set to match the real target when submitting
         # to real hardware, so this is a realistic noisy preview, not an
         # idealized one.
-        target_backend = provider.get_backend(resolved_backend, gateset="native")
+        # The comment above already documented this trap, but the code
+        # never actually implemented the fix: resolved_backend == "ionq_simulator"
+        # (the bare "simulator" alias) was passed straight through as the
+        # transpile TARGET too, silently picking the legacy MS gateset it
+        # warns about. Redirect the transpile target to a real Forte-class
+        # device's gateset in that case, while still executing on the free
+        # simulator with no noise model (no specific real device requested).
+        transpile_target_name = "qpu.forte-1" if resolved_backend == "ionq_simulator" else resolved_backend
+        target_backend = provider.get_backend(transpile_target_name, gateset="native")
         sim_backend = provider.get_backend("ionq_simulator", gateset="native")
         if is_hardware:
             # Named noise models exist for real IonQ devices (docs.ionq.com/
