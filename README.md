@@ -70,7 +70,7 @@ graph TD
     end
 
     subgraph Execution Plane
-        MCP["MCP Server\nserver.py + tools_chemistry.py\n50 tools"]
+        MCP["MCP Server\nserver.py + tools_chemistry.py\n52 tools"]
         IBMAPI["IBM Quantum API\nQiskit Runtime"]
         IonQAPI["IonQ REST API"]
         BraketAPI["AWS Braket API"]
@@ -126,7 +126,7 @@ Every 2 hours, `snapshot.py` records calibration state across all 19 backends. D
 
 ---
 
-## Tools (50 total)
+## Tools (52 total)
 
 ### Device intelligence
 
@@ -204,6 +204,8 @@ rest of the server still runs if it is missing.
 | `circuit_report` | Full dry-run: gate counts, qubit mapping, per-pair CX errors, estimated fidelity |
 | `estimate_runtime` | QPU minutes + queue wait estimate before you submit |
 | `route_job` | Credit-aware routing — cheapest backend that meets your error threshold |
+| `verify_stabilizer_circuit` | Exact measurement distribution for any Clifford-only circuit (H, S, CX, CZ, ...) via the stabilizer tableau — not simulated, not estimated, exact, and scales to hundreds of qubits (Gottesman-Knill theorem). Confirmed: a 150-qubit Clifford circuit verifies in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible |
+| `verify_stabilizer_hardware_result` | Verifies real hardware measurement counts against a Clifford circuit's exact stabilizer prediction — a real fidelity lower bound at any qubit count, no simulation required |
 
 ### Circuit intelligence (derived from real experiments)
 
@@ -380,7 +382,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. All 50 tools appear under the hammer icon.
+Restart Claude Desktop. All 52 tools appear under the hammer icon.
 
 ---
 
@@ -426,6 +428,7 @@ Restart Claude Desktop. All 50 tools appear under the hammer icon.
 - [x] `encode_4way_collision` — multi-column parallel LNAA, **178.8× on ibm_fez** — first hardware-confirmed 4-way Pascal collision
 - [x] Singmaster Step 3 — **~300× amplification, 30 qubits, ibm_kingston**
 - [x] Singmaster Step 4 — **178.8× amplification, 24 qubits, ibm_fez** (hardware record)
+- [x] `verify_stabilizer_circuit` / `verify_stabilizer_hardware_result` — exact, classically-computable verification for any Clifford-only circuit via the stabilizer tableau (Gottesman-Knill theorem), not simulated, scales to hundreds of qubits. Confirmed against real state-vector simulation on a non-trivial circuit and confirmed to verify a 150-qubit circuit exactly in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible. Ported from quantum-verifier's core/stabilizer.py
 
 **Next**
 - [ ] Web interface — visual frontend for device comparison, job submission, circuit playground, live results (in progress: quantum-hardware-web)
