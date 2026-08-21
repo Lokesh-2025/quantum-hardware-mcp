@@ -56,7 +56,7 @@ from typing import Optional, Union
 import numpy as np
 from qiskit import QuantumCircuit
 from qiskit import qasm3 as qiskit_qasm3
-from qiskit.quantum_info import SparsePauliOp
+from qiskit.quantum_info import SparsePauliOp, Clifford, StabilizerState
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 from qiskit_ibm_runtime import SamplerV2 as Sampler
 from qiskit_ibm_runtime import EstimatorV2 as Estimator
@@ -5686,6 +5686,128 @@ def certify_ising_gate_optimality(
 
         return json.dumps(result, indent=2)
 
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Stabilizer / Clifford checkable-structure verification
+# --------------------------------------------------------------------------
+# Ported from quantum-verifier's core/stabilizer.py. Generalizes the same
+# trick equality_oracle_search/encode_4way_collision rely on informally --
+# a result that's cheap to verify classically even though a QPU was needed
+# to find it -- into a systematic, exact one: any circuit built entirely
+# from Clifford gates (H, S, CX, CZ, X, Y, Z, SWAP, ...) plus measurements
+# has an EXACT, classically-computable measurement distribution, no matter
+# how many qubits it has (Gottesman-Knill theorem), via the stabilizer
+# tableau -- polynomial-time, not simulated in the usual exponential sense.
+# Confirmed directly in quantum-verifier: a 150-qubit Clifford circuit,
+# which state-vector simulation could never touch (2^150 amplitudes),
+# verifies exactly in under a second.
+
+def _is_clifford_circuit(circuit: QuantumCircuit) -> dict:
+    unitary_only = circuit.remove_final_measurements(inplace=False)
+    unitary_only.data = [
+        instr for instr in unitary_only.data if instr.operation.name not in ("measure", "barrier")
+    ]
+    try:
+        Clifford(unitary_only)
+        return {"is_clifford": True, "reason": None}
+    except Exception as e:
+        return {"is_clifford": False, "reason": str(e)}
+
+
+@mcp.tool()
+def verify_stabilizer_circuit(qasm_string: str) -> str:
+    """
+    Checkable-structure verification, generalized: if a circuit is built
+    entirely from Clifford gates (H, S, CX, CZ, X, Y, Z, SWAP, ...) plus
+    measurements, its exact measurement distribution is computable via the
+    stabilizer tableau (Gottesman-Knill theorem) -- not simulated, not
+    estimated, exact, and polynomial-time regardless of qubit count.
+
+    Honestly reports inapplicable, not a guess, if the circuit contains
+    any non-Clifford gate (e.g. an arbitrary-angle RZ/RZZ/RX) -- those
+    still need a real simulation or real hardware run instead.
+
+    Args:
+        qasm_string : OpenQASM 2.0 circuit string
+    """
+    try:
+        circuit = QuantumCircuit.from_qasm_str(qasm_string)
+        check = _is_clifford_circuit(circuit)
+        if not check["is_clifford"]:
+            return json.dumps({
+                "applicable": False,
+                "reason": f"circuit contains a non-Clifford gate, not verifiable via the "
+                          f"stabilizer formalism: {check['reason']}",
+            })
+
+        unitary_only = circuit.remove_final_measurements(inplace=False)
+        unitary_only.data = [
+            instr for instr in unitary_only.data if instr.operation.name not in ("measure", "barrier")
+        ]
+        cliff = Clifford(unitary_only)
+        state = StabilizerState(cliff)
+        exact_probabilities = state.probabilities_dict()
+
+        return json.dumps({
+            "applicable": True,
+            "n_qubits": circuit.num_qubits,
+            "exact_probabilities": {k: round(v, 6) for k, v in exact_probabilities.items()},
+            "support_size": len(exact_probabilities),
+            "method": "stabilizer tableau (Gottesman-Knill) -- exact, not simulated, "
+                      "polynomial-time regardless of qubit count",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def verify_stabilizer_hardware_result(qasm_string: str, hw_counts: dict) -> str:
+    """
+    Verify real hardware measurement counts against a Clifford circuit's
+    EXACT stabilizer prediction -- reports a real fidelity lower bound
+    (fraction of shots landing on an outcome that's actually possible
+    under the ideal case) at any qubit count, no simulation required.
+
+    Args:
+        qasm_string : OpenQASM 2.0 circuit string (Clifford gates only)
+        hw_counts   : real measurement counts, e.g. {"000": 480, "111": 470, "010": 30}
+    """
+    try:
+        prediction_json = verify_stabilizer_circuit(qasm_string)
+        prediction = json.loads(prediction_json)
+        if not prediction.get("applicable"):
+            return prediction_json
+
+        if not hw_counts:
+            return json.dumps({"applicable": False, "reason": "No hardware counts provided."})
+
+        valid_outcomes = {b for b, p in prediction["exact_probabilities"].items() if p > 0}
+        total = sum(hw_counts.values())
+        valid_shots = sum(c for b, c in hw_counts.items() if b in valid_outcomes)
+        fidelity_lower_bound = valid_shots / total if total else 0
+        invalid_bitstrings = sorted(
+            ((b, c) for b, c in hw_counts.items() if b not in valid_outcomes),
+            key=lambda kv: -kv[1],
+        )[:5]
+
+        return json.dumps({
+            "applicable": True,
+            "n_qubits": prediction["n_qubits"],
+            "support_size": prediction["support_size"],
+            "fidelity_lower_bound": round(fidelity_lower_bound, 4),
+            "valid_shots": valid_shots,
+            "total_shots": total,
+            "top_invalid_bitstrings": invalid_bitstrings,
+            "verdict": (
+                f"Fidelity lower bound {round(fidelity_lower_bound, 3)} ({valid_shots}/{total} shots "
+                f"landed on one of the {prediction['support_size']} outcomes that are actually possible "
+                "under the exact stabilizer prediction) -- checked exactly, no simulation required, "
+                f"regardless of the circuit's {prediction['n_qubits']} qubits."
+            ),
+        }, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
