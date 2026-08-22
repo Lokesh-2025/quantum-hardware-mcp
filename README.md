@@ -204,6 +204,7 @@ rest of the server still runs if it is missing.
 | `circuit_report` | Full dry-run: gate counts, qubit mapping, per-pair CX errors, estimated fidelity |
 | `estimate_runtime` | QPU minutes + queue wait estimate before you submit |
 | `route_job` | Credit-aware routing — cheapest backend that meets your error threshold |
+| Automatic drift gate (`submit_job`, `ionq_submit_job`) | Before any real submission, both tools automatically check the target device's calibration history for a real alert (error spike >20%, T1/T2 drop, or went offline) in the last 24 hours — no separate `get_alerts` call needed. Blocks by default with `confirm_despite_drift_alert=True` to override, same shape as `confirm_real_hardware`. |
 | `verify_stabilizer_circuit` | Exact measurement distribution for any Clifford-only circuit (H, S, CX, CZ, ...) via the stabilizer tableau — not simulated, not estimated, exact, and scales to hundreds of qubits (Gottesman-Knill theorem). Confirmed: a 150-qubit Clifford circuit verifies in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible |
 | `verify_stabilizer_hardware_result` | Verifies real hardware measurement counts against a Clifford circuit's exact stabilizer prediction — a real fidelity lower bound at any qubit count, no simulation required |
 
@@ -429,6 +430,8 @@ Restart Claude Desktop. All 52 tools appear under the hammer icon.
 - [x] Singmaster Step 3 — **~300× amplification, 30 qubits, ibm_kingston**
 - [x] Singmaster Step 4 — **178.8× amplification, 24 qubits, ibm_fez** (hardware record)
 - [x] `verify_stabilizer_circuit` / `verify_stabilizer_hardware_result` — exact, classically-computable verification for any Clifford-only circuit via the stabilizer tableau (Gottesman-Knill theorem), not simulated, scales to hundreds of qubits. Confirmed against real state-vector simulation on a non-trivial circuit and confirmed to verify a 150-qubit circuit exactly in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible. Ported from quantum-verifier's core/stabilizer.py
+- [x] Fixed `collect_ionq()`: IonQ's `/v0.3/backends` list response never included fidelity data inline — every IonQ calibration snapshot since the collector was written (354 rows) had null error rates. Fixed by following each backend's separate `characterization_url`. Then backfilled 2,175 real historical daily records across all 5 IonQ backends (harmony/forte-1 back to 2022-01, aria-1/2 back to 2023, forte-enterprise-1 back to 2024-11-12) — IonQ's local calibration history now nearly matches IBM's depth.
+- [x] Automatic pre-submission drift gate — `submit_job` (IBM) and `ionq_submit_job` (IonQ, real hardware only) now automatically check the target device's calibration history for a real alert in the last 24 hours before submitting, and refuse by default if one exists. Previously this data (`get_alerts`, `device_history`) existed but had to be manually queried and manually acted on; now it's checked automatically on every real-hardware submission, same blocking pattern as `confirm_real_hardware`. `confirm_despite_drift_alert=True` overrides it.
 
 **Next**
 - [ ] Web interface — visual frontend for device comparison, job submission, circuit playground, live results (in progress: quantum-hardware-web)

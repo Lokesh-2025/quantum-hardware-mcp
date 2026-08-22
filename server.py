@@ -681,10 +681,10 @@ def queue_status() -> str:
 @mcp.tool()
 def device_history(device_name: str, days: int = 7) -> str:
     """
-    Return all saved snapshots for one IBM quantum computer over the last N days.
+    Return all saved snapshots for one quantum computer (IBM or IonQ) over the last N days.
 
     Args:
-        device_name: Machine name, e.g. "ibm_brisbane". Must match exactly.
+        device_name: Machine name, e.g. "ibm_brisbane" or "qpu.forte-enterprise-1". Must match exactly.
         days:        How many days back to look (default 7).
 
     Returns a JSON object with the device name and a list of snapshots in
@@ -895,13 +895,72 @@ def device_on_date(device_name: str, date: str) -> str:
     )
 
 
+def _recent_drift_alert(device_name: str, hours: int = 24) -> Optional[dict]:
+    """
+    Real, fresh calibration problem for this exact device, or None.
+
+    Checks the same two signals get_alerts reports (stored device_alerts
+    rows for cx/readout error spikes and went_offline, plus a live T1/T2
+    drop check) but narrowed to the last `hours` only — an alert from two
+    days ago on a device with several clean snapshots since is stale, not
+    a reason to stop a submission. Only the most recent real alert (if
+    any) is returned.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            """
+            SELECT ts, alert_type, prev_value, curr_value, pct_change
+            FROM device_alerts
+            WHERE device_name = ?
+              AND ts >= datetime('now', ? || ' hours')
+            ORDER BY ts DESC LIMIT 1
+            """,
+            (device_name, f"-{hours}"),
+        ).fetchone()
+        if row:
+            ts, alert_type, prev, curr, pct = row
+            return {"ts": ts, "type": alert_type, "prev_value": prev,
+                    "curr_value": curr, "pct_change": pct}
+
+        t1t2_row = con.execute(
+            """
+            WITH ranked AS (
+                SELECT ts, median_t1_us, median_t2_us,
+                    LAG(median_t1_us) OVER (ORDER BY ts) AS prev_t1,
+                    LAG(median_t2_us) OVER (ORDER BY ts) AS prev_t2
+                FROM device_snapshots
+                WHERE name = ? AND ts >= datetime('now', ? || ' hours')
+            )
+            SELECT ts, median_t1_us, prev_t1, median_t2_us, prev_t2
+            FROM ranked
+            WHERE prev_t1 IS NOT NULL
+              AND (
+                (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
+                OR
+                (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
+              )
+            ORDER BY ts DESC LIMIT 1
+            """,
+            (device_name, f"-{hours}"),
+        ).fetchone()
+        if t1t2_row:
+            ts, t1, prev_t1, t2, prev_t2 = t1t2_row
+            if prev_t1 and prev_t1 > 0 and (prev_t1 - t1) / prev_t1 > 0.20:
+                return {"ts": ts, "type": "t1_drop", "prev_value": prev_t1, "curr_value": t1,
+                        "pct_change": round((prev_t1 - t1) / prev_t1 * 100, 1)}
+            if prev_t2 and prev_t2 > 0 and (prev_t2 - t2) / prev_t2 > 0.20:
+                return {"ts": ts, "type": "t2_drop", "prev_value": prev_t2, "curr_value": t2,
+                        "pct_change": round((prev_t2 - t2) / prev_t2 * 100, 1)}
+    return None
+
+
 # --------------------------------------------------------------------------
 # Tool 8: submit_job
 # --------------------------------------------------------------------------
 
 @mcp.tool()
 def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
-               qasm_version: int = 2) -> str:
+               qasm_version: int = 2, confirm_despite_drift_alert: bool = False) -> str:
     """
     Compile and submit a quantum circuit to an IBM quantum computer.
 
@@ -915,6 +974,11 @@ def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
         shots:        How many times to run the circuit (default 1024, max 20000).
                       More shots = more accurate probability estimates.
         qasm_version: 2 (default) for OpenQASM 2.0, 3 for OpenQASM 3.0.
+        confirm_despite_drift_alert: must be True to submit anyway if this
+                      device had a real calibration alert (error spike,
+                      T1/T2 drop, or went offline) in the last 24 hours —
+                      checked automatically against the local snapshot
+                      history, no separate get_alerts call needed.
 
     Returns JSON with:
       - job_id   Save this — needed for job_status and job_results.
@@ -922,6 +986,16 @@ def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
       - device   Machine the job was sent to.
       - shots    Number of shots requested.
     """
+    drift_alert = _recent_drift_alert(device_name)
+    if drift_alert and not confirm_despite_drift_alert:
+        return json.dumps({
+            "error": f"'{device_name}' had a recent calibration alert: {drift_alert['type']} "
+                     f"at {drift_alert['ts']}.",
+            "hint": "Pass confirm_despite_drift_alert=True to submit anyway. "
+                    "Use device_history or get_alerts to see the full recent trend first.",
+            "drift_alert": drift_alert,
+        })
+
     # Parse the QASM string into a Qiskit QuantumCircuit object.
     # QASM 2 uses QuantumCircuit.from_qasm_str (legacy standard).
     # QASM 3 uses qiskit.qasm3.loads (modern standard with richer features).
@@ -2297,6 +2371,7 @@ def ionq_submit_job(
     expected_amplification: Union[float, list, None] = None,
     amplification_tolerance: float = 0.5,
     confirm_real_hardware: bool = False,
+    confirm_despite_drift_alert: bool = False,
 ) -> str:
     """
     Compile and submit one or more OpenQASM 2 circuits to IonQ as ONE job.
@@ -2349,6 +2424,12 @@ def ionq_submit_job(
                         expected_amplification)
         confirm_real_hardware : must be True to submit to actual QPU hardware.
                         Not required for the simulator.
+        confirm_despite_drift_alert : must be True to submit to real hardware
+                        anyway if this exact backend had a real calibration
+                        alert (error spike, T1/T2 drop, or went offline) in
+                        the last 24 hours — checked automatically against
+                        the local snapshot history. Not checked for the
+                        simulator.
 
     Returns job_id(s), self-check results, and whether this went to real
     hardware or the free simulator.
@@ -2504,6 +2585,18 @@ def ionq_submit_job(
                 "hint": "Pass confirm_real_hardware=True to actually submit. Self-check passed, so the circuit is ready when you are.",
                 "self_check": self_check,
             })
+
+        if is_hardware:
+            drift_alert = _recent_drift_alert(resolved_backend)
+            if drift_alert and not confirm_despite_drift_alert:
+                return json.dumps({
+                    "error": f"'{resolved_backend}' had a recent calibration alert: "
+                             f"{drift_alert['type']} at {drift_alert['ts']}.",
+                    "hint": "Pass confirm_despite_drift_alert=True to submit anyway. "
+                            "Use device_history or get_alerts to see the full recent trend first.",
+                    "drift_alert": drift_alert,
+                    "self_check": self_check,
+                })
 
         t_circuits = [transpile(qc, backend=target_backend, optimization_level=optimization_level) for qc in circuits]
         job = target_backend.run(t_circuits, shots=shots)
@@ -2817,7 +2910,7 @@ def estimate_ionq_cost(qasm_circuits: list, shots: int = 4096) -> str:
 @mcp.tool()
 def get_alerts(device_name: str = "", days: int = 7) -> str:
     """
-    Return calibration drift alerts for IBM Quantum devices.
+    Return calibration drift alerts for any device (IBM or IonQ).
 
     The snapshot agent (runs every 6 hours) compares each new snapshot
     against the previous one. When a device's avg_cx_error or
@@ -2829,7 +2922,7 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
     at the next snapshot automatically.
 
     Args:
-        device_name : filter to one device (e.g. "ibm_boston") — leave empty for all
+        device_name : filter to one device (e.g. "ibm_boston" or "qpu.forte-enterprise-1") — leave empty for all
         days        : how many days back to look (default 7)
 
     Returns a list of alerts with device name, alert type, values, and timestamp.
