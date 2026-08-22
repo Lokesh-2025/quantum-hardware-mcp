@@ -359,18 +359,27 @@ def _two_qubit_errors(props) -> list[float]:
 
 
 def collect_ionq() -> list[dict]:
-    """Fetch live calibration data from IonQ REST API. Free — no job credits used."""
+    """
+    Fetch live calibration data from IonQ REST API. Free — no job credits used.
+
+    Real bug, found 2026-08-22, silently present since this collector was
+    written: IonQ's /v0.3/backends list response does NOT include fidelity
+    data inline -- b.get("characterization") was always {}. The real
+    numbers live behind a separate characterization_url per backend that
+    needs its own follow-up GET (confirmed against the working pattern
+    already used in quantum-verifier's providers/ionq.py::ionq_compare_devices).
+    Every IonQ snapshot this project ever logged (354 rows, checked
+    directly) has null calibration fields as a result -- the automation
+    ran on schedule the whole time, it just never had real data to save.
+    """
     api_key = os.getenv("IONQ_API_KEY")
     if not api_key:
         print("  [IonQ] IONQ_API_KEY not set — skipping", file=sys.stderr)
         return []
 
+    headers = {"Authorization": f"apiKey {api_key}"}
     try:
-        resp = requests.get(
-            "https://api.ionq.co/v0.3/backends",
-            headers={"Authorization": f"apiKey {api_key}"},
-            timeout=15,
-        )
+        resp = requests.get("https://api.ionq.co/v0.3/backends", headers=headers, timeout=15)
         resp.raise_for_status()
         backends = resp.json()
     except Exception as e:
@@ -379,19 +388,31 @@ def collect_ionq() -> list[dict]:
 
     rows = []
     for b in backends:
-        # IonQ returns fidelity data per backend
-        fidelity = b.get("characterization", {}) or {}
+        char_url = b.get("characterization_url")
+        fidelity, timing = {}, {}
+        if char_url:
+            try:
+                char_resp = requests.get(f"https://api.ionq.co/v0.3{char_url}", headers=headers, timeout=15)
+                if char_resp.status_code == 200:
+                    char = char_resp.json()
+                    fidelity = char.get("fidelity", {}) or {}
+                    timing = char.get("timing", {}) or {}
+            except Exception as e:
+                print(f"  [IonQ] characterization fetch failed for {b.get('backend')}: {e}", file=sys.stderr)
+
         row = {
             "provider":   "ionq",
             "name":       b.get("backend", b.get("name", "unknown")),
             "num_qubits": b.get("qubits"),
             "operational": 1 if b.get("status") == "available" else 0,
             "pending_jobs": None,
-            # IonQ reports 1q/2q gate fidelity — convert to error rate (1 - fidelity)
+            # IonQ reports 1q/2q/spam fidelity — convert to error rate (1 - fidelity)
             "avg_cx_error": round(1 - fidelity["2q"]["mean"], 5)
                 if fidelity.get("2q", {}).get("mean") else None,
-            "avg_readout_error": round(1 - fidelity.get("1q", {}).get("mean", 1), 5)
-                if fidelity.get("1q", {}).get("mean") else None,
+            "avg_readout_error": round(1 - fidelity.get("spam", {}).get("mean", 1), 5)
+                if fidelity.get("spam", {}).get("mean") else None,
+            "median_t1_us": round(timing["t1"] * 1e6, 3) if timing.get("t1") else None,
+            "median_t2_us": round(timing["t2"] * 1e6, 3) if timing.get("t2") else None,
         }
         rows.append(row)
 
