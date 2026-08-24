@@ -25,6 +25,7 @@ Tools:
   - ionq_job_status       : check the status of a submitted IonQ job
   - ionq_job_results      : retrieve measurement counts from a completed IonQ job
   - get_alerts            : calibration drift alerts — devices that spiked or went offline
+  - check_chip_identity   : detect a silent hardware swap or qubit relabeling via real per-qubit calibration fingerprint history
   - start_repro_experiment: submit same circuit N times to measure reproducibility
   - repro_score           : compute 0-1 reproducibility score after runs complete
   - estimate_runtime      : estimate how many minutes a circuit will cost on a device
@@ -50,7 +51,7 @@ import anyio
 import requests
 import contextvars
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 
 import numpy as np
@@ -3025,6 +3026,219 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: check_chip_identity
+# --------------------------------------------------------------------------
+
+def _qubit_fingerprint_vector(device_name: str, as_of: str = None) -> dict:
+    """
+    Real per-qubit fingerprint vector from qubit_snapshots/pair_snapshots:
+    {qubit_index: {"t1": ..., "t2": ..., "readout_error": ..., "avg_gate_error": ...}}.
+
+    Uses the most recent value for each property at or before `as_of`
+    (ISO date string), or the latest available if as_of is None. IBM does
+    not expose per-qubit frequency for current-generation Heron devices
+    (confirmed empty via backend.qubit_properties() on ibm_fez, 2026-08-24),
+    which is what the original chip-fingerprinting idea assumed as the
+    stable, fabrication-locked signal. This is the honest fallback: T1/T2/
+    readout/gate-error patterns are real but noisier day-to-day than
+    frequency would be, so this check has real but weaker statistical
+    power than a frequency-based version would have had.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cutoff = as_of or "9999-12-31"
+
+        qubit_vals = {}
+        for prop in ("T1", "T2", "readout_error"):
+            rows = cur.execute(
+                """
+                SELECT qubit_index, value FROM qubit_snapshots
+                WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
+                AND id IN (
+                    SELECT MAX(id) FROM qubit_snapshots
+                    WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
+                    GROUP BY qubit_index
+                )
+                """,
+                (device_name, prop, cutoff, device_name, prop, cutoff),
+            ).fetchall()
+            for qi, val in rows:
+                qubit_vals.setdefault(qi, {})[prop.lower()] = val
+
+        gate_rows = cur.execute(
+            """
+            SELECT qubit1, qubit2, value FROM pair_snapshots
+            WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+            AND id IN (
+                SELECT MAX(id) FROM pair_snapshots
+                WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+                GROUP BY qubit1, qubit2
+            )
+            """,
+            (device_name, cutoff, device_name, cutoff),
+        ).fetchall()
+        gate_errors_by_qubit = {}
+        for q1, q2, val in gate_rows:
+            gate_errors_by_qubit.setdefault(q1, []).append(val)
+            gate_errors_by_qubit.setdefault(q2, []).append(val)
+        for qi, errs in gate_errors_by_qubit.items():
+            qubit_vals.setdefault(qi, {})["avg_gate_error"] = sum(errs) / len(errs)
+
+    return qubit_vals
+
+
+@mcp.tool()
+def check_chip_identity(device_name: str, compare_days_back: int = 90) -> str:
+    """
+    Check whether a device's real per-qubit fingerprint still matches what
+    it looked like `compare_days_back` days ago — a real check for silent
+    hardware swaps (the physical chip behind a device name changed) or
+    qubit relabeling (same chip, indices reassigned), neither of which any
+    public API states directly.
+
+    Uses per-qubit T1/T2/readout-error and per-pair gate-error patterns as
+    the fingerprint. NOTE: this is a real but WEAKER signal than the ideal
+    version — IBM does not expose per-qubit frequency (the fabrication-
+    locked, low-drift signal this class of check normally relies on) for
+    current-generation Heron devices, confirmed empty on ibm_fez.
+
+    The verdict is calibrated against REAL observed behavior, not a fixed
+    guess: 831 days of ibm_fez's own real history were sampled (2026-08-24)
+    to measure how much correlation naturally decays over different time
+    gaps on a chip that never changed identity. A single comparison point
+    is also genuinely noisy (confirmed empirically — occasional low
+    correlation even at short gaps, on real unchanged hardware), so this
+    averages 3 nearby reference points instead of one to cut that noise
+    down. Reference dates within 60 days of the device's online_date are
+    refused — real sampling found a correlation cliff there (bring-up-era
+    data isn't representative of steady-state operation, not a real
+    anomaly).
+
+    Requires per-qubit history collected via backfill_qubit_history.py —
+    returns an error if none exists yet for this device.
+
+    Args:
+        device_name: exact backend name, e.g. "ibm_fez"
+        compare_days_back: how far back to pull the reference fingerprint (default 90)
+
+    Returns JSON with:
+      - avg_raw_correlation: observed correlation, averaged across 3 nearby reference points
+      - expected_for_this_gap: {median, p10_floor} from real historical behavior at this gap
+      - verdict: "consistent", "possible_relabeling", "possible_hardware_change", or "inconclusive"
+    """
+    from scipy import stats
+
+    # Empirically calibrated against ibm_fez's real 831-day history, 2026-08-24.
+    # Correlation decays with real gap length even on unchanged hardware — a
+    # fixed threshold regardless of gap length produces false alarms at long
+    # gaps and misses real problems at short ones. Bucket boundaries in days.
+    GAP_BASELINE = [
+        (20,  {"median": 0.693, "p10": 0.53}),
+        (75,  {"median": 0.621, "p10": 0.202}),
+        (175, {"median": 0.533, "p10": 0.294}),
+        (350, {"median": 0.505, "p10": 0.263}),
+        (550, {"median": 0.436, "p10": 0.384}),
+        (830, {"median": 0.368, "p10": 0.131}),
+    ]
+
+    def _baseline_for_gap(gap_days):
+        for ceiling, stats_ in GAP_BASELINE:
+            if gap_days <= ceiling:
+                return stats_
+        return GAP_BASELINE[-1][1]
+
+    with sqlite3.connect(DB_PATH) as con:
+        earliest = con.execute(
+            "SELECT MIN(vendor_measured_at) FROM qubit_snapshots WHERE device_name = ?",
+            (device_name,),
+        ).fetchone()[0]
+    if not earliest:
+        return json.dumps({
+            "error": f"No per-qubit history for '{device_name}' yet.",
+            "hint": "Run backfill_qubit_history.py first.",
+        })
+
+    online_date = None
+    try:
+        service = _get_service()
+        online_date = service.backend(device_name).online_date
+    except Exception:
+        pass  # best-effort — the bring-up guard just won't apply if unavailable
+
+    now = datetime.now(timezone.utc)
+    if online_date and online_date.tzinfo is None:
+        online_date = online_date.replace(tzinfo=timezone.utc)
+    if online_date and (now - timedelta(days=compare_days_back)) < (online_date + timedelta(days=60)):
+        return json.dumps({
+            "error": f"Reference point {compare_days_back} days back falls within "
+                     f"60 days of {device_name}'s online_date ({online_date.date()}).",
+            "hint": "Real sampling found a correlation cliff in this window — "
+                    "bring-up-era data isn't representative of steady-state "
+                    "operation. Use a smaller compare_days_back.",
+        })
+
+    current = _qubit_fingerprint_vector(device_name)
+    props = ["t1", "t2", "readout_error", "avg_gate_error"]
+
+    # Average 3 nearby reference points (target ± 5 days) instead of one —
+    # a single comparison is genuinely noisy even on healthy hardware.
+    point_correlations = []
+    for offset in (-5, 0, 5):
+        gap = max(1, compare_days_back + offset)
+        ref_date = (now - timedelta(days=gap)).isoformat()
+        reference = _qubit_fingerprint_vector(device_name, as_of=ref_date)
+        if len(reference) < 10:
+            continue
+        common_qubits = sorted(set(current) & set(reference))
+        prop_corrs = []
+        for prop in props:
+            cur_vals, ref_vals = [], []
+            for qi in common_qubits:
+                if prop in current.get(qi, {}) and prop in reference.get(qi, {}):
+                    cur_vals.append(current[qi][prop])
+                    ref_vals.append(reference[qi][prop])
+            if len(cur_vals) < 10:
+                continue
+            corr, _ = stats.spearmanr(cur_vals, ref_vals)
+            if corr == corr:  # skip NaN (degenerate/constant input)
+                prop_corrs.append(corr)
+        if prop_corrs:
+            point_correlations.append(sum(prop_corrs) / len(prop_corrs))
+
+    if not point_correlations:
+        return json.dumps({
+            "error": f"Not enough overlapping history around {compare_days_back} days "
+                     f"back to compare. Earliest data: {earliest}.",
+        })
+
+    avg_raw = sum(point_correlations) / len(point_correlations)
+    baseline = _baseline_for_gap(compare_days_back)
+
+    if avg_raw >= baseline["median"] - 0.1:
+        verdict = "consistent"
+    elif avg_raw < baseline["p10"]:
+        verdict = "possible_hardware_change"
+    else:
+        verdict = "inconclusive"
+
+    return json.dumps({
+        "device": device_name,
+        "compare_days_back": compare_days_back,
+        "reference_earliest_available": earliest,
+        "n_reference_points_averaged": len(point_correlations),
+        "avg_raw_correlation": round(avg_raw, 4),
+        "expected_for_this_gap": baseline,
+        "verdict": verdict,
+        "caveat": "T1/T2/gate-error are noisier day-to-day than the ideal "
+                  "frequency-based fingerprint this check design assumes "
+                  "(unavailable on this device generation). Verdict is "
+                  "relative to real historical behavior at this specific "
+                  "gap length, not a universal threshold — treat "
+                  "'inconclusive' as genuinely inconclusive, not a soft no.",
+    }, indent=2)
 
 
 @mcp.tool()

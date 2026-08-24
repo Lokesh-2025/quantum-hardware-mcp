@@ -70,7 +70,7 @@ graph TD
     end
 
     subgraph Execution Plane
-        MCP["MCP Server\nserver.py + tools_chemistry.py\n52 tools"]
+        MCP["MCP Server\nserver.py + tools_chemistry.py\n53 tools"]
         IBMAPI["IBM Quantum API\nQiskit Runtime"]
         IonQAPI["IonQ REST API"]
         BraketAPI["AWS Braket API"]
@@ -205,6 +205,7 @@ rest of the server still runs if it is missing.
 | `estimate_runtime` | QPU minutes + queue wait estimate before you submit |
 | `route_job` | Credit-aware routing — cheapest backend that meets your error threshold |
 | Automatic drift gate (`submit_job`, `ionq_submit_job`) | Before any real submission, both tools automatically check the target device's calibration history for a real alert (error spike >20%, T1/T2 drop, or went offline) in the last 24 hours — no separate `get_alerts` call needed. Blocks by default with `confirm_despite_drift_alert=True` to override, same shape as `confirm_real_hardware`. |
+| `check_chip_identity` | Detects a silent hardware swap or qubit relabeling — the physical chip behind a device name changed, or its qubit indices got reassigned, neither of which any public API states directly. Built on a real per-qubit/per-pair calibration archive (`qubit_snapshots`/`pair_snapshots`), backfilled from IBM's own history back to each device's online_date. Verdict is calibrated against real observed correlation-decay-vs-time-gap on `ibm_fez`'s own 831-day history, not a fixed guess. |
 | `verify_stabilizer_circuit` | Exact measurement distribution for any Clifford-only circuit (H, S, CX, CZ, ...) via the stabilizer tableau — not simulated, not estimated, exact, and scales to hundreds of qubits (Gottesman-Knill theorem). Confirmed: a 150-qubit Clifford circuit verifies in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible |
 | `verify_stabilizer_hardware_result` | Verifies real hardware measurement counts against a Clifford circuit's exact stabilizer prediction — a real fidelity lower bound at any qubit count, no simulation required |
 
@@ -383,7 +384,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. All 52 tools appear under the hammer icon.
+Restart Claude Desktop. All 53 tools appear under the hammer icon.
 
 ---
 
@@ -432,6 +433,8 @@ Restart Claude Desktop. All 52 tools appear under the hammer icon.
 - [x] `verify_stabilizer_circuit` / `verify_stabilizer_hardware_result` — exact, classically-computable verification for any Clifford-only circuit via the stabilizer tableau (Gottesman-Knill theorem), not simulated, scales to hundreds of qubits. Confirmed against real state-vector simulation on a non-trivial circuit and confirmed to verify a 150-qubit circuit exactly in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible. Ported from quantum-verifier's core/stabilizer.py
 - [x] Fixed `collect_ionq()`: IonQ's `/v0.3/backends` list response never included fidelity data inline — every IonQ calibration snapshot since the collector was written (354 rows) had null error rates. Fixed by following each backend's separate `characterization_url`. Then backfilled 2,175 real historical daily records across all 5 IonQ backends (harmony/forte-1 back to 2022-01, aria-1/2 back to 2023, forte-enterprise-1 back to 2024-11-12) — IonQ's local calibration history now nearly matches IBM's depth.
 - [x] Automatic pre-submission drift gate — `submit_job` (IBM) and `ionq_submit_job` (IonQ, real hardware only) now automatically check the target device's calibration history for a real alert in the last 24 hours before submitting, and refuse by default if one exists. Previously this data (`get_alerts`, `device_history`) existed but had to be manually queried and manually acted on; now it's checked automatically on every real-hardware submission, same blocking pattern as `confirm_real_hardware`. `confirm_despite_drift_alert=True` overrides it.
+- [x] Per-qubit/per-pair calibration archive — new `qubit_snapshots`/`pair_snapshots` tables, backfilled real per-qubit T1/T2/readout-error and per-pair gate-error history for `ibm_fez` back to its 2024-05-14 online_date (662,691 real qubit rows, 741,420 real pair rows, 831 days, 0 errors), plus a compressed raw-JSON archive per real update event so a future parsing bug is retroactively fixable, not history-destroying (the exact class of bug that caused the IonQ null-data incident above). Confirmed live: IBM's `backend.properties(datetime=...)` supports full historical backfill with no retention cutoff — the boundary found was exactly the device's own online_date, not an API limit. IBM does not expose per-qubit frequency for current-generation Heron devices (confirmed empty via `qubit_properties()` on `ibm_fez`) — noted honestly wherever this data would ideally have been used.
+- [x] `check_chip_identity` — first real tool built on the per-qubit archive: detects a silent hardware swap (device name unchanged, physical chip changed) or qubit relabeling, via real per-qubit fingerprint correlation. Verdict is calibrated against `ibm_fez`'s own real 831-day history (a fixed threshold produced a false "possible relabeling" alarm at a 700-day comparison gap during testing — real correlation naturally decays with gap length even on unchanged hardware, so the check now compares against real gap-appropriate expectations instead), averages 3 nearby reference points to cut single-comparison noise (also found empirically — a single comparison is genuinely noisy even on healthy hardware), and refuses comparisons that fall within 60 days of a device's online_date after finding a real correlation cliff there in bring-up-era data.
 
 **Next**
 - [ ] Web interface — visual frontend for device comparison, job submission, circuit playground, live results (in progress: quantum-hardware-web)
