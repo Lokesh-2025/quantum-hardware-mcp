@@ -4,12 +4,15 @@ using backend.properties(datetime=...), confirmed live to work back to each
 device's real online_date with no cutoff (verified 2026-08-24 against
 ibm_fez: works back to 2024-05-14, matching its online_date exactly).
 
-Schema follows the write-on-change design: each row is keyed by the
-property's own real vendor-reported timestamp, not our poll time, so
-querying the same real value on consecutive days naturally dedupes via
-the UNIQUE constraint instead of wasting space. Also archives the raw
-properties blob per real update event, so a future parsing bug (like the
-IonQ null-data bug) is retroactively fixable instead of losing history.
+This is a ONE-TIME historical catch-up. Going forward, snapshot.py's
+regular collection cycle (every 2h, local LaunchAgent) keeps this archive
+current on its own via save_qubit_and_pair_snapshot() — see snapshot.py.
+Re-run this script only if backfilling a new device or a gap.
+
+Schema and row-writing logic are shared with snapshot.py (single source
+of truth, so the live collector and this backfill can't drift out of
+sync) — this script just drives the same functions across many historical
+dates instead of one live snapshot.
 """
 import gzip
 import json
@@ -24,90 +27,10 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from qiskit_ibm_runtime import QiskitRuntimeService
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "devices.db")
+import snapshot as _snapshot
+
+DB_PATH = _snapshot.DB_PATH
 DEVICES = ["ibm_fez"]
-
-
-def _init_schema(con):
-    con.executescript("""
-        CREATE TABLE IF NOT EXISTS qubit_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_name TEXT NOT NULL,
-            provider TEXT NOT NULL DEFAULT 'ibm',
-            qubit_index INTEGER NOT NULL,
-            property_name TEXT NOT NULL,
-            value REAL,
-            unit TEXT,
-            vendor_measured_at TEXT NOT NULL,
-            polled_at TEXT NOT NULL,
-            UNIQUE(device_name, qubit_index, property_name, vendor_measured_at)
-        );
-        CREATE INDEX IF NOT EXISTS idx_qubit_snapshots_lookup
-            ON qubit_snapshots (device_name, qubit_index, property_name, vendor_measured_at);
-
-        CREATE TABLE IF NOT EXISTS pair_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_name TEXT NOT NULL,
-            provider TEXT NOT NULL DEFAULT 'ibm',
-            qubit1 INTEGER NOT NULL,
-            qubit2 INTEGER NOT NULL,
-            gate_name TEXT NOT NULL,
-            property_name TEXT NOT NULL,
-            value REAL,
-            unit TEXT,
-            vendor_measured_at TEXT NOT NULL,
-            polled_at TEXT NOT NULL,
-            UNIQUE(device_name, qubit1, qubit2, gate_name, property_name, vendor_measured_at)
-        );
-        CREATE INDEX IF NOT EXISTS idx_pair_snapshots_lookup
-            ON pair_snapshots (device_name, qubit1, qubit2, vendor_measured_at);
-
-        CREATE TABLE IF NOT EXISTS raw_properties_archive (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_name TEXT NOT NULL,
-            provider TEXT NOT NULL DEFAULT 'ibm',
-            vendor_measured_at TEXT NOT NULL,
-            raw_json_gzip BLOB NOT NULL,
-            polled_at TEXT NOT NULL,
-            UNIQUE(device_name, vendor_measured_at)
-        );
-
-        CREATE TABLE IF NOT EXISTS chip_epochs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_name TEXT NOT NULL,
-            epoch_number INTEGER NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            detection_reason TEXT,
-            freq_vector_correlation REAL
-        );
-    """)
-    con.commit()
-
-
-def _properties_to_raw_dict(props):
-    return {
-        "last_update_date": str(props.last_update_date),
-        "qubits": [
-            [
-                {"name": nduv.name, "value": nduv.value, "unit": nduv.unit,
-                 "date": str(nduv.date)}
-                for nduv in q
-            ]
-            for q in props.qubits
-        ],
-        "gates": [
-            {
-                "gate": g.gate, "qubits": list(g.qubits),
-                "parameters": [
-                    {"name": p.name, "value": p.value, "unit": p.unit,
-                     "date": str(p.date)}
-                    for p in g.parameters
-                ],
-            }
-            for g in props.gates
-        ],
-    }
 
 
 def backfill_device(con, service, device_name, days_back_start=830):
@@ -136,7 +59,7 @@ def backfill_device(con, service, device_name, days_back_start=830):
         polled_at = datetime.now(timezone.utc).isoformat()
         vendor_measured_at = str(props.last_update_date)
 
-        raw = _properties_to_raw_dict(props)
+        raw = _snapshot.properties_to_raw_dict(props)
         blob = gzip.compress(json.dumps(raw).encode("utf-8"))
         cur.execute(
             "INSERT OR IGNORE INTO raw_properties_archive "
@@ -189,8 +112,8 @@ def backfill_device(con, service, device_name, days_back_start=830):
 
 
 def main():
+    _snapshot._init_db()
     con = sqlite3.connect(DB_PATH)
-    _init_schema(con)
 
     service = QiskitRuntimeService()
 
