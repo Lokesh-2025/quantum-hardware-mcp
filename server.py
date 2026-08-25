@@ -386,6 +386,57 @@ def get_device_details(device_name: str) -> str:
 # Tool 6: best_qubits
 # --------------------------------------------------------------------------
 
+def _find_connected_qubit_subset(qubit_scores: dict, coupling_map, n: int, num_seeds: int = 10):
+    """
+    Real bug found 2026-08-25 (reported by a real user, quantum-chemistry-vqe,
+    confirmed live and reproducible against ibm_fez): best_qubits used to pick
+    the top-n qubits by individual score alone, with connectivity only ever
+    checked AFTER the fact as a warning message the returned answer itself
+    ignored. A real user hit this directly -- 8 qubits with zero real
+    connections between them, a flood of SWAP gates, and a chemistry energy
+    off by more than 1 Hartree, not real noise, a selection bug.
+
+    This actually searches for a connected subset instead of just flagging
+    when the naive top-n isn't one. Greedy expansion from each of the top
+    `num_seeds` individually-scored qubits: grow a connected set one qubit
+    at a time, always adding whichever adjacent-to-the-current-set qubit has
+    the best individual score, until it reaches size n. Tries multiple seeds
+    (not just the single best-scored qubit) because starting from qubit #2
+    might reach a much better-connected neighborhood than starting from #1.
+    Returns the best-scoring connected set of size n found this way, or None
+    if no connected subset of that size exists at all (e.g. no coupling map,
+    or n exceeds the largest connected component).
+    """
+    if coupling_map is None:
+        return None
+    adjacency: dict[int, set] = {}
+    for a, b in coupling_map.get_edges():
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set()).add(a)
+
+    sorted_qubits = sorted(qubit_scores.keys(), key=lambda q: qubit_scores[q])
+    seeds = sorted_qubits[:num_seeds]
+
+    best_subset, best_total = None, float("inf")
+    for seed in seeds:
+        subset = {seed}
+        frontier = set(adjacency.get(seed, set()))
+        while len(subset) < n and frontier:
+            candidates = [q for q in frontier if q in qubit_scores]
+            if not candidates:
+                break
+            best_next = min(candidates, key=lambda q: qubit_scores[q])
+            subset.add(best_next)
+            frontier.discard(best_next)
+            frontier |= adjacency.get(best_next, set()) - subset
+        if len(subset) == n:
+            total = sum(qubit_scores[q] for q in subset)
+            if total < best_total:
+                best_total, best_subset = total, subset
+
+    return best_subset
+
+
 @mcp.tool()
 def best_qubits(device_name: str, n: int = 5) -> str:
     """
@@ -405,6 +456,15 @@ def best_qubits(device_name: str, n: int = 5) -> str:
     T1 / T2 coherence times are included as supplementary context.
     Missing metrics are penalised with 1.0 (worst possible) so qubits with
     incomplete calibration data sort to the bottom.
+
+    Actually searches for a CONNECTED subset of n qubits (not just the
+    top-n by score, which can land on scattered, unconnected qubits) —
+    fixed 2026-08-25 after a real user hit this directly: 8 top-scored
+    qubits with zero real connections between them, forcing a flood of
+    SWAP gates and producing a chemistry energy off by more than 1
+    Hartree. See connectivity.connected in the response — false means no
+    fully-connected set of this size existed and it fell back to
+    top-by-score, which is still worth checking before use.
     """
     service = _get_service()
     backend = service.backend(device_name)
@@ -455,38 +515,56 @@ def best_qubits(device_name: str, n: int = 5) -> str:
         })
 
     qubit_data.sort(key=lambda q: q["score"])
-    top_n = qubit_data[:n]
-
-    # Connectivity check: warn if the returned qubits are not all connected
-    # on the hardware graph. Unconnected qubit sets force SWAP injection.
-    top_indices = {q["qubit"] for q in top_n}
     coupling_map = backend.coupling_map
-    connected_pairs = []
+
+    # Real fix, 2026-08-25: actually search for a connected subset instead
+    # of picking the top-n by score alone and only warning after the fact
+    # if it happens not to be connected — see _find_connected_qubit_subset's
+    # docstring for the real bug this replaces.
+    qubit_scores = {q["qubit"]: q["score"] for q in qubit_data}
+    connected_subset = _find_connected_qubit_subset(qubit_scores, coupling_map, n)
+
     disconnected_warning = None
+    if connected_subset is not None:
+        connected = True
+        by_qubit = {q["qubit"]: q for q in qubit_data}
+        top_n = sorted((by_qubit[q] for q in connected_subset), key=lambda q: q["score"])
+        top_indices = connected_subset
+    else:
+        connected = False
+        top_n = qubit_data[:n]
+        top_indices = {q["qubit"] for q in top_n}
+        if coupling_map is not None:
+            disconnected_warning = (
+                f"No connected set of {n} qubits could be found on "
+                f"{device_name}'s coupling map — falling back to the top {n} "
+                f"qubits by individual score, which are NOT all connected. "
+                f"Running a multi-qubit circuit on these qubits will require "
+                f"SWAP gates, increasing your gate count."
+            )
+        else:
+            disconnected_warning = (
+                f"{device_name} has no coupling map available — cannot verify "
+                f"connectivity, returning top {n} qubits by individual score only."
+            )
+
+    connected_pairs = []
     if coupling_map is not None:
         edges = list(coupling_map.get_edges())
         connected_pairs = [
             [a, b] for a, b in edges
             if a in top_indices and b in top_indices
         ]
-        # A set of n qubits needs at least n-1 edges to be connected (tree).
-        if len(connected_pairs) < n - 1:
-            disconnected_warning = (
-                f"WARNING: the top {n} qubits by score are NOT all connected "
-                f"on {device_name}'s coupling map. Only {len(connected_pairs)} "
-                f"direct links found between them. Running a multi-qubit circuit "
-                f"on these qubits will require SWAP gates, increasing your gate "
-                f"count. Consider using check_routing_overhead or picking qubits "
-                f"from a connected subgraph."
-            )
 
     result = {
         "device":   device_name,
         "n":        n,
-        "scoring":  "readout_error + best_cx_error (lower = better). "
+        "scoring":  "readout_error + best_cx_error (lower = better), "
+                    "restricted to a connected subset when one exists. "
                     "T1/T2 shown for context but not in score.",
         "best_qubits": top_n,
         "connectivity": {
+            "connected": connected,
             "direct_links_between_top_qubits": connected_pairs,
             "warning": disconnected_warning,
         },
@@ -512,6 +590,10 @@ def compare_devices(sort_by: str = "cx_error") -> str:
                  "combined"  – blended score: 70% quality + 30% availability
 
     Returns a JSON object with the ranking and a note about what it means.
+    Only devices whose real status is "active" (not just "operational",
+    which alone isn't reliable enough — fixed 2026-08-25 after a real user
+    reported a top-ranked device sitting queued indefinitely) are ever
+    ranked; everything else is reported separately in unavailable_devices.
 
     Note: fetching calibration data for every device takes ~10–30 seconds
     because it makes one API call per device.
@@ -528,7 +610,16 @@ def compare_devices(sort_by: str = "cx_error") -> str:
             "num_qubits": backend.num_qubits,
             "pending_jobs": status.pending_jobs,
             "operational": status.operational,
-            "status": "online" if status.operational else "offline",
+            # Real bug found 2026-08-25 (reported by a real user, confirmed
+            # by reading this code directly): this used to collapse IBM's
+            # actual status message down to just "online"/"offline" based
+            # on `operational` alone, throwing away the real state. IBM's
+            # `operational` can stay True during states that aren't really
+            # "ready to use" the same way — a top-ranked device could sit
+            # queued indefinitely with no explanation. Now keeps the real
+            # message and uses it (not just `operational`) to decide
+            # ranking eligibility below.
+            "status": status.status_msg,
         }
 
         # Always fetch calibration data so every device card has full fields
@@ -560,6 +651,14 @@ def compare_devices(sort_by: str = "cx_error") -> str:
             pass  # calibration unavailable — leave fields absent
 
         devices.append(entry)
+
+    # Real fix, 2026-08-25: never let a device that isn't actually "active"
+    # win the top rank. `operational` alone isn't a reliable enough signal
+    # (see the comment above) — require the real status message too.
+    all_devices = devices
+    devices = [d for d in all_devices if d["status"] == "active" and d["operational"]]
+    available_names = {d["name"] for d in devices}
+    unavailable_devices = [d for d in all_devices if d["name"] not in available_names]
 
     # Apply the requested sort
     if sort_by == "cx_error":
@@ -618,11 +717,12 @@ def compare_devices(sort_by: str = "cx_error") -> str:
                      "Use 'cx_error', 'queue', 'qubits', or 'combined'."
         })
 
-    # Stamp each entry with its rank number (1 = best)
+    # Stamp each entry with its rank number (1 = best) — only real,
+    # active-and-operational devices are ranked at all now.
     for i, device in enumerate(devices):
         device["rank"] = i + 1
 
-    _save_snapshots(devices)
+    _save_snapshots(all_devices)  # save everything, ranked or not, for real history
     return json.dumps(
         {
             "sorted_by": sort_by,
@@ -634,6 +734,13 @@ def compare_devices(sort_by: str = "cx_error") -> str:
                             "Score is min-max normalised across current devices.",
             }.get(sort_by, ""),
             "devices": devices,
+            "unavailable_devices": unavailable_devices,
+            "unavailable_note": (
+                "Devices excluded from ranking because their real status isn't "
+                "'active' — a top-ranked device that's actually unavailable would "
+                "otherwise sit queued indefinitely with no explanation."
+                if unavailable_devices else None
+            ),
         },
         indent=2,
     )
