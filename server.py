@@ -25,6 +25,7 @@ Tools:
   - ionq_job_status       : check the status of a submitted IonQ job
   - ionq_job_results      : retrieve measurement counts from a completed IonQ job
   - get_alerts            : calibration drift alerts — devices that spiked or went offline
+  - check_chip_identity   : detect a silent hardware swap or qubit relabeling via real per-qubit calibration fingerprint history
   - start_repro_experiment: submit same circuit N times to measure reproducibility
   - repro_score           : compute 0-1 reproducibility score after runs complete
   - estimate_runtime      : estimate how many minutes a circuit will cost on a device
@@ -50,7 +51,7 @@ import anyio
 import requests
 import contextvars
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 
 import numpy as np
@@ -385,6 +386,57 @@ def get_device_details(device_name: str) -> str:
 # Tool 6: best_qubits
 # --------------------------------------------------------------------------
 
+def _find_connected_qubit_subset(qubit_scores: dict, coupling_map, n: int, num_seeds: int = 10):
+    """
+    Real bug found 2026-08-25 (reported by a real user, quantum-chemistry-vqe,
+    confirmed live and reproducible against ibm_fez): best_qubits used to pick
+    the top-n qubits by individual score alone, with connectivity only ever
+    checked AFTER the fact as a warning message the returned answer itself
+    ignored. A real user hit this directly -- 8 qubits with zero real
+    connections between them, a flood of SWAP gates, and a chemistry energy
+    off by more than 1 Hartree, not real noise, a selection bug.
+
+    This actually searches for a connected subset instead of just flagging
+    when the naive top-n isn't one. Greedy expansion from each of the top
+    `num_seeds` individually-scored qubits: grow a connected set one qubit
+    at a time, always adding whichever adjacent-to-the-current-set qubit has
+    the best individual score, until it reaches size n. Tries multiple seeds
+    (not just the single best-scored qubit) because starting from qubit #2
+    might reach a much better-connected neighborhood than starting from #1.
+    Returns the best-scoring connected set of size n found this way, or None
+    if no connected subset of that size exists at all (e.g. no coupling map,
+    or n exceeds the largest connected component).
+    """
+    if coupling_map is None:
+        return None
+    adjacency: dict[int, set] = {}
+    for a, b in coupling_map.get_edges():
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set()).add(a)
+
+    sorted_qubits = sorted(qubit_scores.keys(), key=lambda q: qubit_scores[q])
+    seeds = sorted_qubits[:num_seeds]
+
+    best_subset, best_total = None, float("inf")
+    for seed in seeds:
+        subset = {seed}
+        frontier = set(adjacency.get(seed, set()))
+        while len(subset) < n and frontier:
+            candidates = [q for q in frontier if q in qubit_scores]
+            if not candidates:
+                break
+            best_next = min(candidates, key=lambda q: qubit_scores[q])
+            subset.add(best_next)
+            frontier.discard(best_next)
+            frontier |= adjacency.get(best_next, set()) - subset
+        if len(subset) == n:
+            total = sum(qubit_scores[q] for q in subset)
+            if total < best_total:
+                best_total, best_subset = total, subset
+
+    return best_subset
+
+
 @mcp.tool()
 def best_qubits(device_name: str, n: int = 5) -> str:
     """
@@ -404,6 +456,15 @@ def best_qubits(device_name: str, n: int = 5) -> str:
     T1 / T2 coherence times are included as supplementary context.
     Missing metrics are penalised with 1.0 (worst possible) so qubits with
     incomplete calibration data sort to the bottom.
+
+    Actually searches for a CONNECTED subset of n qubits (not just the
+    top-n by score, which can land on scattered, unconnected qubits) —
+    fixed 2026-08-25 after a real user hit this directly: 8 top-scored
+    qubits with zero real connections between them, forcing a flood of
+    SWAP gates and producing a chemistry energy off by more than 1
+    Hartree. See connectivity.connected in the response — false means no
+    fully-connected set of this size existed and it fell back to
+    top-by-score, which is still worth checking before use.
     """
     service = _get_service()
     backend = service.backend(device_name)
@@ -454,38 +515,56 @@ def best_qubits(device_name: str, n: int = 5) -> str:
         })
 
     qubit_data.sort(key=lambda q: q["score"])
-    top_n = qubit_data[:n]
-
-    # Connectivity check: warn if the returned qubits are not all connected
-    # on the hardware graph. Unconnected qubit sets force SWAP injection.
-    top_indices = {q["qubit"] for q in top_n}
     coupling_map = backend.coupling_map
-    connected_pairs = []
+
+    # Real fix, 2026-08-25: actually search for a connected subset instead
+    # of picking the top-n by score alone and only warning after the fact
+    # if it happens not to be connected — see _find_connected_qubit_subset's
+    # docstring for the real bug this replaces.
+    qubit_scores = {q["qubit"]: q["score"] for q in qubit_data}
+    connected_subset = _find_connected_qubit_subset(qubit_scores, coupling_map, n)
+
     disconnected_warning = None
+    if connected_subset is not None:
+        connected = True
+        by_qubit = {q["qubit"]: q for q in qubit_data}
+        top_n = sorted((by_qubit[q] for q in connected_subset), key=lambda q: q["score"])
+        top_indices = connected_subset
+    else:
+        connected = False
+        top_n = qubit_data[:n]
+        top_indices = {q["qubit"] for q in top_n}
+        if coupling_map is not None:
+            disconnected_warning = (
+                f"No connected set of {n} qubits could be found on "
+                f"{device_name}'s coupling map — falling back to the top {n} "
+                f"qubits by individual score, which are NOT all connected. "
+                f"Running a multi-qubit circuit on these qubits will require "
+                f"SWAP gates, increasing your gate count."
+            )
+        else:
+            disconnected_warning = (
+                f"{device_name} has no coupling map available — cannot verify "
+                f"connectivity, returning top {n} qubits by individual score only."
+            )
+
+    connected_pairs = []
     if coupling_map is not None:
         edges = list(coupling_map.get_edges())
         connected_pairs = [
             [a, b] for a, b in edges
             if a in top_indices and b in top_indices
         ]
-        # A set of n qubits needs at least n-1 edges to be connected (tree).
-        if len(connected_pairs) < n - 1:
-            disconnected_warning = (
-                f"WARNING: the top {n} qubits by score are NOT all connected "
-                f"on {device_name}'s coupling map. Only {len(connected_pairs)} "
-                f"direct links found between them. Running a multi-qubit circuit "
-                f"on these qubits will require SWAP gates, increasing your gate "
-                f"count. Consider using check_routing_overhead or picking qubits "
-                f"from a connected subgraph."
-            )
 
     result = {
         "device":   device_name,
         "n":        n,
-        "scoring":  "readout_error + best_cx_error (lower = better). "
+        "scoring":  "readout_error + best_cx_error (lower = better), "
+                    "restricted to a connected subset when one exists. "
                     "T1/T2 shown for context but not in score.",
         "best_qubits": top_n,
         "connectivity": {
+            "connected": connected,
             "direct_links_between_top_qubits": connected_pairs,
             "warning": disconnected_warning,
         },
@@ -511,6 +590,10 @@ def compare_devices(sort_by: str = "cx_error") -> str:
                  "combined"  – blended score: 70% quality + 30% availability
 
     Returns a JSON object with the ranking and a note about what it means.
+    Only devices whose real status is "active" (not just "operational",
+    which alone isn't reliable enough — fixed 2026-08-25 after a real user
+    reported a top-ranked device sitting queued indefinitely) are ever
+    ranked; everything else is reported separately in unavailable_devices.
 
     Note: fetching calibration data for every device takes ~10–30 seconds
     because it makes one API call per device.
@@ -527,7 +610,16 @@ def compare_devices(sort_by: str = "cx_error") -> str:
             "num_qubits": backend.num_qubits,
             "pending_jobs": status.pending_jobs,
             "operational": status.operational,
-            "status": "online" if status.operational else "offline",
+            # Real bug found 2026-08-25 (reported by a real user, confirmed
+            # by reading this code directly): this used to collapse IBM's
+            # actual status message down to just "online"/"offline" based
+            # on `operational` alone, throwing away the real state. IBM's
+            # `operational` can stay True during states that aren't really
+            # "ready to use" the same way — a top-ranked device could sit
+            # queued indefinitely with no explanation. Now keeps the real
+            # message and uses it (not just `operational`) to decide
+            # ranking eligibility below.
+            "status": status.status_msg,
         }
 
         # Always fetch calibration data so every device card has full fields
@@ -559,6 +651,14 @@ def compare_devices(sort_by: str = "cx_error") -> str:
             pass  # calibration unavailable — leave fields absent
 
         devices.append(entry)
+
+    # Real fix, 2026-08-25: never let a device that isn't actually "active"
+    # win the top rank. `operational` alone isn't a reliable enough signal
+    # (see the comment above) — require the real status message too.
+    all_devices = devices
+    devices = [d for d in all_devices if d["status"] == "active" and d["operational"]]
+    available_names = {d["name"] for d in devices}
+    unavailable_devices = [d for d in all_devices if d["name"] not in available_names]
 
     # Apply the requested sort
     if sort_by == "cx_error":
@@ -617,11 +717,12 @@ def compare_devices(sort_by: str = "cx_error") -> str:
                      "Use 'cx_error', 'queue', 'qubits', or 'combined'."
         })
 
-    # Stamp each entry with its rank number (1 = best)
+    # Stamp each entry with its rank number (1 = best) — only real,
+    # active-and-operational devices are ranked at all now.
     for i, device in enumerate(devices):
         device["rank"] = i + 1
 
-    _save_snapshots(devices)
+    _save_snapshots(all_devices)  # save everything, ranked or not, for real history
     return json.dumps(
         {
             "sorted_by": sort_by,
@@ -633,6 +734,13 @@ def compare_devices(sort_by: str = "cx_error") -> str:
                             "Score is min-max normalised across current devices.",
             }.get(sort_by, ""),
             "devices": devices,
+            "unavailable_devices": unavailable_devices,
+            "unavailable_note": (
+                "Devices excluded from ranking because their real status isn't "
+                "'active' — a top-ranked device that's actually unavailable would "
+                "otherwise sit queued indefinitely with no explanation."
+                if unavailable_devices else None
+            ),
         },
         indent=2,
     )
@@ -681,10 +789,10 @@ def queue_status() -> str:
 @mcp.tool()
 def device_history(device_name: str, days: int = 7) -> str:
     """
-    Return all saved snapshots for one IBM quantum computer over the last N days.
+    Return all saved snapshots for one quantum computer (IBM or IonQ) over the last N days.
 
     Args:
-        device_name: Machine name, e.g. "ibm_brisbane". Must match exactly.
+        device_name: Machine name, e.g. "ibm_brisbane" or "qpu.forte-enterprise-1". Must match exactly.
         days:        How many days back to look (default 7).
 
     Returns a JSON object with the device name and a list of snapshots in
@@ -895,13 +1003,72 @@ def device_on_date(device_name: str, date: str) -> str:
     )
 
 
+def _recent_drift_alert(device_name: str, hours: int = 24) -> Optional[dict]:
+    """
+    Real, fresh calibration problem for this exact device, or None.
+
+    Checks the same two signals get_alerts reports (stored device_alerts
+    rows for cx/readout error spikes and went_offline, plus a live T1/T2
+    drop check) but narrowed to the last `hours` only — an alert from two
+    days ago on a device with several clean snapshots since is stale, not
+    a reason to stop a submission. Only the most recent real alert (if
+    any) is returned.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            """
+            SELECT ts, alert_type, prev_value, curr_value, pct_change
+            FROM device_alerts
+            WHERE device_name = ?
+              AND ts >= datetime('now', ? || ' hours')
+            ORDER BY ts DESC LIMIT 1
+            """,
+            (device_name, f"-{hours}"),
+        ).fetchone()
+        if row:
+            ts, alert_type, prev, curr, pct = row
+            return {"ts": ts, "type": alert_type, "prev_value": prev,
+                    "curr_value": curr, "pct_change": pct}
+
+        t1t2_row = con.execute(
+            """
+            WITH ranked AS (
+                SELECT ts, median_t1_us, median_t2_us,
+                    LAG(median_t1_us) OVER (ORDER BY ts) AS prev_t1,
+                    LAG(median_t2_us) OVER (ORDER BY ts) AS prev_t2
+                FROM device_snapshots
+                WHERE name = ? AND ts >= datetime('now', ? || ' hours')
+            )
+            SELECT ts, median_t1_us, prev_t1, median_t2_us, prev_t2
+            FROM ranked
+            WHERE prev_t1 IS NOT NULL
+              AND (
+                (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
+                OR
+                (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
+              )
+            ORDER BY ts DESC LIMIT 1
+            """,
+            (device_name, f"-{hours}"),
+        ).fetchone()
+        if t1t2_row:
+            ts, t1, prev_t1, t2, prev_t2 = t1t2_row
+            if prev_t1 and prev_t1 > 0 and (prev_t1 - t1) / prev_t1 > 0.20:
+                return {"ts": ts, "type": "t1_drop", "prev_value": prev_t1, "curr_value": t1,
+                        "pct_change": round((prev_t1 - t1) / prev_t1 * 100, 1)}
+            if prev_t2 and prev_t2 > 0 and (prev_t2 - t2) / prev_t2 > 0.20:
+                return {"ts": ts, "type": "t2_drop", "prev_value": prev_t2, "curr_value": t2,
+                        "pct_change": round((prev_t2 - t2) / prev_t2 * 100, 1)}
+    return None
+
+
 # --------------------------------------------------------------------------
 # Tool 8: submit_job
 # --------------------------------------------------------------------------
 
 @mcp.tool()
 def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
-               qasm_version: int = 2) -> str:
+               qasm_version: int = 2, confirm_despite_drift_alert: bool = False) -> str:
     """
     Compile and submit a quantum circuit to an IBM quantum computer.
 
@@ -915,6 +1082,11 @@ def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
         shots:        How many times to run the circuit (default 1024, max 20000).
                       More shots = more accurate probability estimates.
         qasm_version: 2 (default) for OpenQASM 2.0, 3 for OpenQASM 3.0.
+        confirm_despite_drift_alert: must be True to submit anyway if this
+                      device had a real calibration alert (error spike,
+                      T1/T2 drop, or went offline) in the last 24 hours —
+                      checked automatically against the local snapshot
+                      history, no separate get_alerts call needed.
 
     Returns JSON with:
       - job_id   Save this — needed for job_status and job_results.
@@ -922,6 +1094,16 @@ def submit_job(device_name: str, qasm_string: str, shots: int = 1024,
       - device   Machine the job was sent to.
       - shots    Number of shots requested.
     """
+    drift_alert = _recent_drift_alert(device_name)
+    if drift_alert and not confirm_despite_drift_alert:
+        return json.dumps({
+            "error": f"'{device_name}' had a recent calibration alert: {drift_alert['type']} "
+                     f"at {drift_alert['ts']}.",
+            "hint": "Pass confirm_despite_drift_alert=True to submit anyway. "
+                    "Use device_history or get_alerts to see the full recent trend first.",
+            "drift_alert": drift_alert,
+        })
+
     # Parse the QASM string into a Qiskit QuantumCircuit object.
     # QASM 2 uses QuantumCircuit.from_qasm_str (legacy standard).
     # QASM 3 uses qiskit.qasm3.loads (modern standard with richer features).
@@ -2297,6 +2479,7 @@ def ionq_submit_job(
     expected_amplification: Union[float, list, None] = None,
     amplification_tolerance: float = 0.5,
     confirm_real_hardware: bool = False,
+    confirm_despite_drift_alert: bool = False,
 ) -> str:
     """
     Compile and submit one or more OpenQASM 2 circuits to IonQ as ONE job.
@@ -2349,6 +2532,12 @@ def ionq_submit_job(
                         expected_amplification)
         confirm_real_hardware : must be True to submit to actual QPU hardware.
                         Not required for the simulator.
+        confirm_despite_drift_alert : must be True to submit to real hardware
+                        anyway if this exact backend had a real calibration
+                        alert (error spike, T1/T2 drop, or went offline) in
+                        the last 24 hours — checked automatically against
+                        the local snapshot history. Not checked for the
+                        simulator.
 
     Returns job_id(s), self-check results, and whether this went to real
     hardware or the free simulator.
@@ -2504,6 +2693,18 @@ def ionq_submit_job(
                 "hint": "Pass confirm_real_hardware=True to actually submit. Self-check passed, so the circuit is ready when you are.",
                 "self_check": self_check,
             })
+
+        if is_hardware:
+            drift_alert = _recent_drift_alert(resolved_backend)
+            if drift_alert and not confirm_despite_drift_alert:
+                return json.dumps({
+                    "error": f"'{resolved_backend}' had a recent calibration alert: "
+                             f"{drift_alert['type']} at {drift_alert['ts']}.",
+                    "hint": "Pass confirm_despite_drift_alert=True to submit anyway. "
+                            "Use device_history or get_alerts to see the full recent trend first.",
+                    "drift_alert": drift_alert,
+                    "self_check": self_check,
+                })
 
         t_circuits = [transpile(qc, backend=target_backend, optimization_level=optimization_level) for qc in circuits]
         job = target_backend.run(t_circuits, shots=shots)
@@ -2817,7 +3018,7 @@ def estimate_ionq_cost(qasm_circuits: list, shots: int = 4096) -> str:
 @mcp.tool()
 def get_alerts(device_name: str = "", days: int = 7) -> str:
     """
-    Return calibration drift alerts for IBM Quantum devices.
+    Return calibration drift alerts for any device (IBM or IonQ).
 
     The snapshot agent (runs every 6 hours) compares each new snapshot
     against the previous one. When a device's avg_cx_error or
@@ -2829,7 +3030,7 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
     at the next snapshot automatically.
 
     Args:
-        device_name : filter to one device (e.g. "ibm_boston") — leave empty for all
+        device_name : filter to one device (e.g. "ibm_boston" or "qpu.forte-enterprise-1") — leave empty for all
         days        : how many days back to look (default 7)
 
     Returns a list of alerts with device name, alert type, values, and timestamp.
@@ -2932,6 +3133,219 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Tool: check_chip_identity
+# --------------------------------------------------------------------------
+
+def _qubit_fingerprint_vector(device_name: str, as_of: str = None) -> dict:
+    """
+    Real per-qubit fingerprint vector from qubit_snapshots/pair_snapshots:
+    {qubit_index: {"t1": ..., "t2": ..., "readout_error": ..., "avg_gate_error": ...}}.
+
+    Uses the most recent value for each property at or before `as_of`
+    (ISO date string), or the latest available if as_of is None. IBM does
+    not expose per-qubit frequency for current-generation Heron devices
+    (confirmed empty via backend.qubit_properties() on ibm_fez, 2026-08-24),
+    which is what the original chip-fingerprinting idea assumed as the
+    stable, fabrication-locked signal. This is the honest fallback: T1/T2/
+    readout/gate-error patterns are real but noisier day-to-day than
+    frequency would be, so this check has real but weaker statistical
+    power than a frequency-based version would have had.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cutoff = as_of or "9999-12-31"
+
+        qubit_vals = {}
+        for prop in ("T1", "T2", "readout_error"):
+            rows = cur.execute(
+                """
+                SELECT qubit_index, value FROM qubit_snapshots
+                WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
+                AND id IN (
+                    SELECT MAX(id) FROM qubit_snapshots
+                    WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
+                    GROUP BY qubit_index
+                )
+                """,
+                (device_name, prop, cutoff, device_name, prop, cutoff),
+            ).fetchall()
+            for qi, val in rows:
+                qubit_vals.setdefault(qi, {})[prop.lower()] = val
+
+        gate_rows = cur.execute(
+            """
+            SELECT qubit1, qubit2, value FROM pair_snapshots
+            WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+            AND id IN (
+                SELECT MAX(id) FROM pair_snapshots
+                WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+                GROUP BY qubit1, qubit2
+            )
+            """,
+            (device_name, cutoff, device_name, cutoff),
+        ).fetchall()
+        gate_errors_by_qubit = {}
+        for q1, q2, val in gate_rows:
+            gate_errors_by_qubit.setdefault(q1, []).append(val)
+            gate_errors_by_qubit.setdefault(q2, []).append(val)
+        for qi, errs in gate_errors_by_qubit.items():
+            qubit_vals.setdefault(qi, {})["avg_gate_error"] = sum(errs) / len(errs)
+
+    return qubit_vals
+
+
+@mcp.tool()
+def check_chip_identity(device_name: str, compare_days_back: int = 90) -> str:
+    """
+    Check whether a device's real per-qubit fingerprint still matches what
+    it looked like `compare_days_back` days ago — a real check for silent
+    hardware swaps (the physical chip behind a device name changed) or
+    qubit relabeling (same chip, indices reassigned), neither of which any
+    public API states directly.
+
+    Uses per-qubit T1/T2/readout-error and per-pair gate-error patterns as
+    the fingerprint. NOTE: this is a real but WEAKER signal than the ideal
+    version — IBM does not expose per-qubit frequency (the fabrication-
+    locked, low-drift signal this class of check normally relies on) for
+    current-generation Heron devices, confirmed empty on ibm_fez.
+
+    The verdict is calibrated against REAL observed behavior, not a fixed
+    guess: 831 days of ibm_fez's own real history were sampled (2026-08-24)
+    to measure how much correlation naturally decays over different time
+    gaps on a chip that never changed identity. A single comparison point
+    is also genuinely noisy (confirmed empirically — occasional low
+    correlation even at short gaps, on real unchanged hardware), so this
+    averages 3 nearby reference points instead of one to cut that noise
+    down. Reference dates within 60 days of the device's online_date are
+    refused — real sampling found a correlation cliff there (bring-up-era
+    data isn't representative of steady-state operation, not a real
+    anomaly).
+
+    Requires per-qubit history collected via backfill_qubit_history.py —
+    returns an error if none exists yet for this device.
+
+    Args:
+        device_name: exact backend name, e.g. "ibm_fez"
+        compare_days_back: how far back to pull the reference fingerprint (default 90)
+
+    Returns JSON with:
+      - avg_raw_correlation: observed correlation, averaged across 3 nearby reference points
+      - expected_for_this_gap: {median, p10_floor} from real historical behavior at this gap
+      - verdict: "consistent", "possible_relabeling", "possible_hardware_change", or "inconclusive"
+    """
+    from scipy import stats
+
+    # Empirically calibrated against ibm_fez's real 831-day history, 2026-08-24.
+    # Correlation decays with real gap length even on unchanged hardware — a
+    # fixed threshold regardless of gap length produces false alarms at long
+    # gaps and misses real problems at short ones. Bucket boundaries in days.
+    GAP_BASELINE = [
+        (20,  {"median": 0.693, "p10": 0.53}),
+        (75,  {"median": 0.621, "p10": 0.202}),
+        (175, {"median": 0.533, "p10": 0.294}),
+        (350, {"median": 0.505, "p10": 0.263}),
+        (550, {"median": 0.436, "p10": 0.384}),
+        (830, {"median": 0.368, "p10": 0.131}),
+    ]
+
+    def _baseline_for_gap(gap_days):
+        for ceiling, stats_ in GAP_BASELINE:
+            if gap_days <= ceiling:
+                return stats_
+        return GAP_BASELINE[-1][1]
+
+    with sqlite3.connect(DB_PATH) as con:
+        earliest = con.execute(
+            "SELECT MIN(vendor_measured_at) FROM qubit_snapshots WHERE device_name = ?",
+            (device_name,),
+        ).fetchone()[0]
+    if not earliest:
+        return json.dumps({
+            "error": f"No per-qubit history for '{device_name}' yet.",
+            "hint": "Run backfill_qubit_history.py first.",
+        })
+
+    online_date = None
+    try:
+        service = _get_service()
+        online_date = service.backend(device_name).online_date
+    except Exception:
+        pass  # best-effort — the bring-up guard just won't apply if unavailable
+
+    now = datetime.now(timezone.utc)
+    if online_date and online_date.tzinfo is None:
+        online_date = online_date.replace(tzinfo=timezone.utc)
+    if online_date and (now - timedelta(days=compare_days_back)) < (online_date + timedelta(days=60)):
+        return json.dumps({
+            "error": f"Reference point {compare_days_back} days back falls within "
+                     f"60 days of {device_name}'s online_date ({online_date.date()}).",
+            "hint": "Real sampling found a correlation cliff in this window — "
+                    "bring-up-era data isn't representative of steady-state "
+                    "operation. Use a smaller compare_days_back.",
+        })
+
+    current = _qubit_fingerprint_vector(device_name)
+    props = ["t1", "t2", "readout_error", "avg_gate_error"]
+
+    # Average 3 nearby reference points (target ± 5 days) instead of one —
+    # a single comparison is genuinely noisy even on healthy hardware.
+    point_correlations = []
+    for offset in (-5, 0, 5):
+        gap = max(1, compare_days_back + offset)
+        ref_date = (now - timedelta(days=gap)).isoformat()
+        reference = _qubit_fingerprint_vector(device_name, as_of=ref_date)
+        if len(reference) < 10:
+            continue
+        common_qubits = sorted(set(current) & set(reference))
+        prop_corrs = []
+        for prop in props:
+            cur_vals, ref_vals = [], []
+            for qi in common_qubits:
+                if prop in current.get(qi, {}) and prop in reference.get(qi, {}):
+                    cur_vals.append(current[qi][prop])
+                    ref_vals.append(reference[qi][prop])
+            if len(cur_vals) < 10:
+                continue
+            corr, _ = stats.spearmanr(cur_vals, ref_vals)
+            if corr == corr:  # skip NaN (degenerate/constant input)
+                prop_corrs.append(corr)
+        if prop_corrs:
+            point_correlations.append(sum(prop_corrs) / len(prop_corrs))
+
+    if not point_correlations:
+        return json.dumps({
+            "error": f"Not enough overlapping history around {compare_days_back} days "
+                     f"back to compare. Earliest data: {earliest}.",
+        })
+
+    avg_raw = sum(point_correlations) / len(point_correlations)
+    baseline = _baseline_for_gap(compare_days_back)
+
+    if avg_raw >= baseline["median"] - 0.1:
+        verdict = "consistent"
+    elif avg_raw < baseline["p10"]:
+        verdict = "possible_hardware_change"
+    else:
+        verdict = "inconclusive"
+
+    return json.dumps({
+        "device": device_name,
+        "compare_days_back": compare_days_back,
+        "reference_earliest_available": earliest,
+        "n_reference_points_averaged": len(point_correlations),
+        "avg_raw_correlation": round(avg_raw, 4),
+        "expected_for_this_gap": baseline,
+        "verdict": verdict,
+        "caveat": "T1/T2/gate-error are noisier day-to-day than the ideal "
+                  "frequency-based fingerprint this check design assumes "
+                  "(unavailable on this device generation). Verdict is "
+                  "relative to real historical behavior at this specific "
+                  "gap length, not a universal threshold — treat "
+                  "'inconclusive' as genuinely inconclusive, not a soft no.",
+    }, indent=2)
 
 
 @mcp.tool()

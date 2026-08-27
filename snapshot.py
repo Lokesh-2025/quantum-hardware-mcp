@@ -180,6 +180,122 @@ def _init_db() -> None:
             ON device_alerts (device_name, ts)
         """)
 
+        # Per-qubit/per-pair calibration archive (2026-08-24) — see
+        # backfill_qubit_history.py for the historical backfill and
+        # server.py::check_chip_identity for the first tool built on this.
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS qubit_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_name TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'ibm',
+                qubit_index INTEGER NOT NULL, property_name TEXT NOT NULL,
+                value REAL, unit TEXT,
+                vendor_measured_at TEXT NOT NULL, polled_at TEXT NOT NULL,
+                UNIQUE(device_name, qubit_index, property_name, vendor_measured_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_qubit_snapshots_lookup
+                ON qubit_snapshots (device_name, qubit_index, property_name, vendor_measured_at);
+
+            CREATE TABLE IF NOT EXISTS pair_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_name TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'ibm',
+                qubit1 INTEGER NOT NULL, qubit2 INTEGER NOT NULL, gate_name TEXT NOT NULL,
+                property_name TEXT NOT NULL, value REAL, unit TEXT,
+                vendor_measured_at TEXT NOT NULL, polled_at TEXT NOT NULL,
+                UNIQUE(device_name, qubit1, qubit2, gate_name, property_name, vendor_measured_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pair_snapshots_lookup
+                ON pair_snapshots (device_name, qubit1, qubit2, vendor_measured_at);
+
+            CREATE TABLE IF NOT EXISTS raw_properties_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_name TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'ibm',
+                vendor_measured_at TEXT NOT NULL, raw_json_gzip BLOB NOT NULL,
+                polled_at TEXT NOT NULL,
+                UNIQUE(device_name, vendor_measured_at)
+            );
+
+            CREATE TABLE IF NOT EXISTS chip_epochs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_name TEXT NOT NULL, epoch_number INTEGER NOT NULL,
+                started_at TEXT NOT NULL, ended_at TEXT,
+                detection_reason TEXT, freq_vector_correlation REAL
+            );
+        """)
+
+
+def properties_to_raw_dict(props) -> dict:
+    """Shared by the live collector and the historical backfill script —
+    keep this the single source of truth for the raw-archive shape."""
+    return {
+        "last_update_date": str(props.last_update_date),
+        "qubits": [
+            [
+                {"name": nduv.name, "value": nduv.value, "unit": nduv.unit,
+                 "date": str(nduv.date)}
+                for nduv in q
+            ]
+            for q in props.qubits
+        ],
+        "gates": [
+            {
+                "gate": g.gate, "qubits": list(g.qubits),
+                "parameters": [
+                    {"name": p.name, "value": p.value, "unit": p.unit,
+                     "date": str(p.date)}
+                    for p in g.parameters
+                ],
+            }
+            for g in props.gates
+        ],
+    }
+
+
+def save_qubit_and_pair_snapshot(device_name: str, props, provider: str = "ibm") -> None:
+    """
+    Write one live properties() snapshot into the per-qubit/per-pair
+    archive. Dedupes for free via the UNIQUE(device, ..., vendor_measured_at)
+    constraint — re-saving an unchanged value is a silent no-op, so calling
+    this every collection cycle (2h) is cheap even though most individual
+    properties only actually change roughly daily.
+    """
+    import gzip
+
+    polled_at = datetime.now(timezone.utc).isoformat()
+    raw = properties_to_raw_dict(props)
+    blob = gzip.compress(json.dumps(raw).encode("utf-8"))
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO raw_properties_archive "
+            "(device_name, provider, vendor_measured_at, raw_json_gzip, polled_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (device_name, provider, str(props.last_update_date), blob, polled_at),
+        )
+        for qi, qubit_params in enumerate(props.qubits):
+            for nduv in qubit_params:
+                cur.execute(
+                    "INSERT OR IGNORE INTO qubit_snapshots "
+                    "(device_name, provider, qubit_index, property_name, value, unit, "
+                    " vendor_measured_at, polled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (device_name, provider, qi, nduv.name, nduv.value, nduv.unit,
+                     str(nduv.date), polled_at),
+                )
+        for g in props.gates:
+            if len(g.qubits) != 2:
+                continue
+            q1, q2 = g.qubits
+            for p in g.parameters:
+                cur.execute(
+                    "INSERT OR IGNORE INTO pair_snapshots "
+                    "(device_name, provider, qubit1, qubit2, gate_name, property_name, "
+                    " value, unit, vendor_measured_at, polled_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (device_name, provider, q1, q2, g.gate, p.name, p.value, p.unit,
+                     str(p.date), polled_at),
+                )
+        con.commit()
+
 
 def _save_snapshots(rows: list[dict]) -> None:
     now = datetime.now(timezone.utc)
@@ -359,18 +475,27 @@ def _two_qubit_errors(props) -> list[float]:
 
 
 def collect_ionq() -> list[dict]:
-    """Fetch live calibration data from IonQ REST API. Free — no job credits used."""
+    """
+    Fetch live calibration data from IonQ REST API. Free — no job credits used.
+
+    Real bug, found 2026-08-22, silently present since this collector was
+    written: IonQ's /v0.3/backends list response does NOT include fidelity
+    data inline -- b.get("characterization") was always {}. The real
+    numbers live behind a separate characterization_url per backend that
+    needs its own follow-up GET (confirmed against the working pattern
+    already used in quantum-verifier's providers/ionq.py::ionq_compare_devices).
+    Every IonQ snapshot this project ever logged (354 rows, checked
+    directly) has null calibration fields as a result -- the automation
+    ran on schedule the whole time, it just never had real data to save.
+    """
     api_key = os.getenv("IONQ_API_KEY")
     if not api_key:
         print("  [IonQ] IONQ_API_KEY not set — skipping", file=sys.stderr)
         return []
 
+    headers = {"Authorization": f"apiKey {api_key}"}
     try:
-        resp = requests.get(
-            "https://api.ionq.co/v0.3/backends",
-            headers={"Authorization": f"apiKey {api_key}"},
-            timeout=15,
-        )
+        resp = requests.get("https://api.ionq.co/v0.3/backends", headers=headers, timeout=15)
         resp.raise_for_status()
         backends = resp.json()
     except Exception as e:
@@ -379,19 +504,31 @@ def collect_ionq() -> list[dict]:
 
     rows = []
     for b in backends:
-        # IonQ returns fidelity data per backend
-        fidelity = b.get("characterization", {}) or {}
+        char_url = b.get("characterization_url")
+        fidelity, timing = {}, {}
+        if char_url:
+            try:
+                char_resp = requests.get(f"https://api.ionq.co/v0.3{char_url}", headers=headers, timeout=15)
+                if char_resp.status_code == 200:
+                    char = char_resp.json()
+                    fidelity = char.get("fidelity", {}) or {}
+                    timing = char.get("timing", {}) or {}
+            except Exception as e:
+                print(f"  [IonQ] characterization fetch failed for {b.get('backend')}: {e}", file=sys.stderr)
+
         row = {
             "provider":   "ionq",
             "name":       b.get("backend", b.get("name", "unknown")),
             "num_qubits": b.get("qubits"),
             "operational": 1 if b.get("status") == "available" else 0,
             "pending_jobs": None,
-            # IonQ reports 1q/2q gate fidelity — convert to error rate (1 - fidelity)
+            # IonQ reports 1q/2q/spam fidelity — convert to error rate (1 - fidelity)
             "avg_cx_error": round(1 - fidelity["2q"]["mean"], 5)
                 if fidelity.get("2q", {}).get("mean") else None,
-            "avg_readout_error": round(1 - fidelity.get("1q", {}).get("mean", 1), 5)
-                if fidelity.get("1q", {}).get("mean") else None,
+            "avg_readout_error": round(1 - fidelity.get("spam", {}).get("mean", 1), 5)
+                if fidelity.get("spam", {}).get("mean") else None,
+            "median_t1_us": round(timing["t1"] * 1e6, 3) if timing.get("t1") else None,
+            "median_t2_us": round(timing["t2"] * 1e6, 3) if timing.get("t2") else None,
         }
         rows.append(row)
 
@@ -495,6 +632,17 @@ def collect_ibm() -> list[dict]:
     for backend in backends:
         status = backend.status()
         props = backend.properties()
+
+        # Feed the per-qubit/per-pair archive from this same live properties()
+        # call — no extra API request. Local only (matches _save_snapshots'
+        # devices.db-only scope; GitHub Actions writes CSV only, see collect()).
+        if props and not os.getenv("GITHUB_ACTIONS"):
+            try:
+                save_qubit_and_pair_snapshot(backend.name, props)
+            except Exception as e:
+                print(f"  [IBM] per-qubit archive save failed for {backend.name}: {e}",
+                      file=sys.stderr)
+
         row = {
             "provider":   "ibm",
             "name":       backend.name,

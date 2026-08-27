@@ -190,7 +190,7 @@ def test_device_on_date(tools, real_device):
 # ---------------------------------------------------------------------------
 
 def test_submit_job_qasm2(tools, real_device):
-    result = tools.submit_job(real_device, BELL_QASM2, shots=128, qasm_version=2)
+    result = tools.submit_job(real_device, BELL_QASM2, shots=128, qasm_version=2, confirm_despite_drift_alert=True)
     data = parse(result)
     assert "job_id" in data, f"submit_job did not return job_id: {data}"
 
@@ -200,7 +200,7 @@ def test_submit_job_qasm2(tools, real_device):
 # ---------------------------------------------------------------------------
 
 def test_submit_job_qasm3(tools, real_device):
-    result = tools.submit_job(real_device, BELL_QASM3, shots=128, qasm_version=3)
+    result = tools.submit_job(real_device, BELL_QASM3, shots=128, qasm_version=3, confirm_despite_drift_alert=True)
     data = parse(result)
     if "error" in data and "qiskit_qasm3_import" in data.get("error", ""):
         pytest.skip("qiskit_qasm3_import not installed in this environment — runs in Docker")
@@ -213,7 +213,7 @@ def test_submit_job_qasm3(tools, real_device):
 
 def test_job_status(tools, real_device):
     # Submit a job first, then check its status
-    sub = parse(tools.submit_job(real_device, BELL_QASM2, shots=128))
+    sub = parse(tools.submit_job(real_device, BELL_QASM2, shots=128, confirm_despite_drift_alert=True))
     job_id = sub.get("job_id")
     assert job_id, "Could not get job_id for job_status test"
 
@@ -229,7 +229,7 @@ def test_job_status(tools, real_device):
 # ---------------------------------------------------------------------------
 
 def test_job_results_queued(tools, real_device):
-    sub = parse(tools.submit_job(real_device, BELL_QASM2, shots=128))
+    sub = parse(tools.submit_job(real_device, BELL_QASM2, shots=128, confirm_despite_drift_alert=True))
     job_id = sub.get("job_id")
     assert job_id
 
@@ -244,7 +244,7 @@ def test_job_results_queued(tools, real_device):
 # ---------------------------------------------------------------------------
 
 def test_cancel_job(tools, real_device):
-    sub = parse(tools.submit_job(real_device, BELL_QASM2, shots=128))
+    sub = parse(tools.submit_job(real_device, BELL_QASM2, shots=128, confirm_despite_drift_alert=True))
     job_id = sub.get("job_id")
     assert job_id
 
