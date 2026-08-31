@@ -43,6 +43,7 @@ Tools:
 """
 
 import os
+import sys
 import json
 import math
 import sqlite3
@@ -89,6 +90,34 @@ import tools_chemistry  # noqa: F401
 
 # Store the database next to this file so it travels with the project.
 DB_PATH = os.path.join(os.path.dirname(__file__), "devices.db")
+
+# Shared Turso database (same one quantum-verifier uses) -- added
+# 2026-08-30. See turso_db.py's docstring for why this uses a plain
+# requests-based client instead of the libsql_client package (a confirmed
+# hang-on-exit bug in that package's sync wrapper).
+
+
+def _get_turso_client():
+    """Kept as a function (not a plain bool) so tests can monkeypatch it
+    to force the local-db fallback path."""
+    from turso_db import is_configured
+    return is_configured()
+
+
+def _run_query(sql: str, params: tuple = ()) -> list:
+    """SELECT helper: tries the shared Turso database first (live, no sync
+    needed); falls back to the local db (DB_PATH) if Turso isn't
+    configured/reachable. Same SQL runs against both -- libsql is
+    SQLite-compatible. Only used where the query's columns exist in
+    Turso's (narrower) shared schema -- see get_alerts()."""
+    if _get_turso_client():
+        try:
+            from turso_db import execute as turso_execute
+            return turso_execute(sql, params)
+        except Exception as e:
+            print(f"Turso query failed, falling back to local db: {e}", file=sys.stderr)
+    with sqlite3.connect(DB_PATH) as con:
+        return con.execute(sql, params).fetchall()
 
 
 def _init_db() -> None:
@@ -1005,7 +1034,11 @@ def device_on_date(device_name: str, date: str) -> str:
 
 def _recent_drift_alert(device_name: str, hours: int = 24) -> Optional[dict]:
     """
-    Real, fresh calibration problem for this exact device, or None.
+    Real, fresh calibration problem for this exact device, or None. This
+    is the real pre-submission safety gate (submit_job/ionq_submit_job
+    check this before spending real money) -- the exact "ibm_boston wasn't
+    recalibrated and nobody knew for 5 hours" scenario get_alerts'
+    docstring describes, but as a hard block, not just a report.
 
     Checks the same two signals get_alerts reports (stored device_alerts
     rows for cx/readout error spikes and went_offline, plus a live T1/T2
@@ -1013,6 +1046,14 @@ def _recent_drift_alert(device_name: str, hours: int = 24) -> Optional[dict]:
     days ago on a device with several clean snapshots since is stale, not
     a reason to stop a submission. Only the most recent real alert (if
     any) is returned.
+
+    T1/T2 check reads via _run_query() (added 2026-08-30) -- Turso-first
+    (live, shared with quantum-verifier), local-db fallback otherwise.
+    This matters here specifically: without it, this safety gate could
+    only ever see drift up to whenever THIS machine's laptop last synced
+    -- exactly the kind of gap that let the original ibm_boston incident
+    go unnoticed. device_alerts (cx/readout/offline) stays local-only for
+    now -- see get_alerts' matching comment.
     """
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute(
@@ -1030,35 +1071,35 @@ def _recent_drift_alert(device_name: str, hours: int = 24) -> Optional[dict]:
             return {"ts": ts, "type": alert_type, "prev_value": prev,
                     "curr_value": curr, "pct_change": pct}
 
-        t1t2_row = con.execute(
-            """
-            WITH ranked AS (
-                SELECT ts, median_t1_us, median_t2_us,
-                    LAG(median_t1_us) OVER (ORDER BY ts) AS prev_t1,
-                    LAG(median_t2_us) OVER (ORDER BY ts) AS prev_t2
-                FROM device_snapshots
-                WHERE name = ? AND ts >= datetime('now', ? || ' hours')
-            )
-            SELECT ts, median_t1_us, prev_t1, median_t2_us, prev_t2
-            FROM ranked
-            WHERE prev_t1 IS NOT NULL
-              AND (
-                (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
-                OR
-                (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
-              )
-            ORDER BY ts DESC LIMIT 1
-            """,
-            (device_name, f"-{hours}"),
-        ).fetchone()
-        if t1t2_row:
-            ts, t1, prev_t1, t2, prev_t2 = t1t2_row
-            if prev_t1 and prev_t1 > 0 and (prev_t1 - t1) / prev_t1 > 0.20:
-                return {"ts": ts, "type": "t1_drop", "prev_value": prev_t1, "curr_value": t1,
-                        "pct_change": round((prev_t1 - t1) / prev_t1 * 100, 1)}
-            if prev_t2 and prev_t2 > 0 and (prev_t2 - t2) / prev_t2 > 0.20:
-                return {"ts": ts, "type": "t2_drop", "prev_value": prev_t2, "curr_value": t2,
-                        "pct_change": round((prev_t2 - t2) / prev_t2 * 100, 1)}
+    t1t2_rows = _run_query(
+        """
+        WITH ranked AS (
+            SELECT ts, median_t1_us, median_t2_us,
+                LAG(median_t1_us) OVER (ORDER BY ts) AS prev_t1,
+                LAG(median_t2_us) OVER (ORDER BY ts) AS prev_t2
+            FROM device_snapshots
+            WHERE name = ? AND ts >= datetime('now', ? || ' hours')
+        )
+        SELECT ts, median_t1_us, prev_t1, median_t2_us, prev_t2
+        FROM ranked
+        WHERE prev_t1 IS NOT NULL
+          AND (
+            (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
+            OR
+            (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
+          )
+        ORDER BY ts DESC LIMIT 1
+        """,
+        (device_name, f"-{hours}"),
+    )
+    if t1t2_rows:
+        ts, t1, prev_t1, t2, prev_t2 = t1t2_rows[0]
+        if prev_t1 and prev_t1 > 0 and (prev_t1 - t1) / prev_t1 > 0.20:
+            return {"ts": ts, "type": "t1_drop", "prev_value": prev_t1, "curr_value": t1,
+                    "pct_change": round((prev_t1 - t1) / prev_t1 * 100, 1)}
+        if prev_t2 and prev_t2 > 0 and (prev_t2 - t2) / prev_t2 > 0.20:
+            return {"ts": ts, "type": "t2_drop", "prev_value": prev_t2, "curr_value": t2,
+                    "pct_change": round((prev_t2 - t2) / prev_t2 * 100, 1)}
     return None
 
 
@@ -3044,50 +3085,65 @@ def get_alerts(device_name: str = "", days: int = 7) -> str:
     import sqlite3 as _sqlite3
 
     db_path = os.path.join(os.path.dirname(__file__), "devices.db")
-    if not os.path.exists(db_path):
-        return json.dumps({"error": "No local database found. Run snapshot.py first."})
 
     try:
-        with _sqlite3.connect(db_path) as con:
-            # Stored alerts (cx/readout/offline) from snapshot.py
-            query = """
-                SELECT ts, device_name, alert_type, prev_value, curr_value, pct_change
-                FROM device_alerts
-                WHERE ts >= datetime('now', ? || ' days')
-            """
-            params: list = [f"-{max(1, int(days))}"]
-            if device_name:
-                query += " AND device_name = ?"
-                params.append(device_name)
-            query += " ORDER BY ts DESC LIMIT 200"
-            stored_rows = con.execute(query, params).fetchall()
-
-            # Live T1/T2 drop detection using LAG() window function
-            t1t2_params: list = [f"-{max(1, int(days))}"]
-            t1t2_filter = ""
-            if device_name:
-                t1t2_filter = "AND name = ?"
-                t1t2_params.append(device_name)
-
-            t1t2_rows = con.execute(f"""
-                WITH ranked AS (
-                    SELECT name, ts, median_t1_us, median_t2_us,
-                        LAG(median_t1_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t1,
-                        LAG(median_t2_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t2
-                    FROM device_snapshots
+        # Stored alerts (cx/readout/offline) from snapshot.py -- still
+        # local-only: these come from _check_and_write_alerts(), which
+        # only runs in the local (non-GITHUB_ACTIONS) collection branch
+        # and writes to this local-only table. Not yet mirrored to
+        # Turso (flagged, not silently done -- a real follow-up, not
+        # part of this pass). Reworked 2026-08-30: no longer an early
+        # return blocking the WHOLE function when this local db is
+        # missing -- the T1/T2 portion below is reachable via Turso
+        # regardless, e.g. on a fresh checkout with no local db yet.
+        stored_rows = []
+        if os.path.exists(db_path):
+            with _sqlite3.connect(db_path) as con:
+                query = """
+                    SELECT ts, device_name, alert_type, prev_value, curr_value, pct_change
+                    FROM device_alerts
                     WHERE ts >= datetime('now', ? || ' days')
-                    {t1t2_filter}
-                )
-                SELECT name, ts, median_t1_us, prev_t1, median_t2_us, prev_t2
-                FROM ranked
-                WHERE prev_t1 IS NOT NULL
-                  AND (
-                    (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
-                    OR
-                    (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
-                  )
-                ORDER BY ts DESC LIMIT 100
-            """, t1t2_params).fetchall()
+                """
+                params: list = [f"-{max(1, int(days))}"]
+                if device_name:
+                    query += " AND device_name = ?"
+                    params.append(device_name)
+                query += " ORDER BY ts DESC LIMIT 200"
+                stored_rows = con.execute(query, params).fetchall()
+
+        # Live T1/T2 drop detection via _run_query() -- Turso-first (live,
+        # 2022-onward, shared with quantum-verifier), falling back to the
+        # local db automatically. Added 2026-08-30. Only median_t1_us/
+        # median_t2_us are needed here, and both exist in the shared
+        # Turso schema unchanged -- unlike device_history/device_profile,
+        # which use many extended fields Turso's table doesn't have and
+        # so are deliberately NOT converted (would lose data, not gain
+        # freshness).
+        t1t2_params: list = [f"-{max(1, int(days))}"]
+        t1t2_filter = ""
+        if device_name:
+            t1t2_filter = "AND name = ?"
+            t1t2_params.append(device_name)
+
+        t1t2_rows = _run_query(f"""
+            WITH ranked AS (
+                SELECT name, ts, median_t1_us, median_t2_us,
+                    LAG(median_t1_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t1,
+                    LAG(median_t2_us) OVER (PARTITION BY name ORDER BY ts) AS prev_t2
+                FROM device_snapshots
+                WHERE ts >= datetime('now', ? || ' days')
+                {t1t2_filter}
+            )
+            SELECT name, ts, median_t1_us, prev_t1, median_t2_us, prev_t2
+            FROM ranked
+            WHERE prev_t1 IS NOT NULL
+              AND (
+                (prev_t1 > 0 AND (prev_t1 - median_t1_us) / prev_t1 > 0.20)
+                OR
+                (prev_t2 > 0 AND (prev_t2 - median_t2_us) / prev_t2 > 0.20)
+              )
+            ORDER BY ts DESC LIMIT 100
+        """, tuple(t1t2_params))
 
         alerts = []
 

@@ -871,8 +871,118 @@ def log_job_result(job_id: str, counts: dict) -> None:
         pass  # never crash the main flow over logging
 
 
+def _write_turso(rows: list[dict], ts: str) -> None:
+    """
+    Added 2026-08-30: writes device-level rows into the shared Turso
+    database (same one quantum-verifier uses) so get_alerts()/
+    device_history()/device_on_date() can read live, current data
+    regardless of whose laptop last ran a local import.
+
+    Scoped to provider in ('ibm', 'ionq') only, matching the scope
+    decision already made on the quantum-verifier side: 'braket/*' rows
+    are a different access path to overlapping hardware (only ~2 months
+    deep, not the same lineage as each vendor's native API), deliberately
+    excluded so the shared table stays one consistent history per device,
+    not two disagreeing ones for the IonQ machines reachable both ways.
+
+    Runs in BOTH branches of collect() (GitHub Actions and local
+    LaunchAgent) -- device-level history should be live everywhere,
+    same as quantum-hardware-mcp's own CSV/devices.db writes already are.
+    Best-effort: failures here don't block the CSV/local db write that
+    already happened, they're logged and skipped.
+    """
+    try:
+        from turso_db import is_configured, execute_batch
+    except Exception as e:
+        print(f"  [Turso] import failed, skipping: {e}", file=sys.stderr)
+        return
+    if not is_configured():
+        print("  [Turso] TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set — skipping.")
+        return
+
+    device_rows = [r for r in rows if r.get("provider") in ("ibm", "ionq")]
+    if not device_rows:
+        return
+
+    try:
+        statements = [
+            ("INSERT INTO device_snapshots (ts, provider, name, num_qubits, operational, "
+             "pending_jobs, avg_cx_error, avg_readout_error, median_t1_us, median_t2_us) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (ts, r.get("provider", "ibm"), r["name"], r.get("num_qubits"),
+              int(r["operational"]) if r.get("operational") is not None else None,
+              r.get("pending_jobs"), r.get("avg_cx_error"), r.get("avg_readout_error"),
+              r.get("median_t1_us"), r.get("median_t2_us")))
+            for r in device_rows
+        ]
+        BATCH = 500
+        for i in range(0, len(statements), BATCH):
+            execute_batch(statements[i:i + BATCH])
+        print(f"  [Turso] wrote {len(device_rows)} device rows — live for anyone running the tool now.")
+    except Exception as e:
+        print(f"  [Turso] write failed (local/CSV save already succeeded): {e}", file=sys.stderr)
+
+
+def _write_turso_qubit_pair(ts_floor: str) -> None:
+    """
+    Local-only companion to _write_turso: pushes whatever qubit/pair rows
+    THIS run just saved into devices.db (filtered by polled_at >= ts_floor)
+    into Turso's qubit_snapshots/pair_snapshots tables too. Only called
+    from the local (non-GITHUB_ACTIONS) branch, matching where
+    save_qubit_and_pair_snapshot() itself already only runs locally (see
+    collect_ibm()'s own comment on why -- avoids extra API load on every
+    CI run).
+    """
+    try:
+        from turso_db import is_configured, execute_batch
+    except Exception as e:
+        print(f"  [Turso] import failed, skipping qubit/pair write: {e}", file=sys.stderr)
+        return
+    if not is_configured():
+        return
+
+    BATCH = 500
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            qubit_rows = con.execute(
+                "SELECT device_name, qubit_index, property_name, value, unit, "
+                "vendor_measured_at, polled_at FROM qubit_snapshots WHERE polled_at >= ?",
+                (ts_floor,),
+            ).fetchall()
+            pair_rows = con.execute(
+                "SELECT device_name, qubit1, qubit2, gate_name, property_name, value, unit, "
+                "vendor_measured_at, polled_at FROM pair_snapshots WHERE polled_at >= ?",
+                (ts_floor,),
+            ).fetchall()
+
+        if qubit_rows:
+            statements = [
+                ("INSERT OR IGNORE INTO qubit_snapshots (device_name, qubit_index, property_name, "
+                 "value, unit, vendor_measured_at, polled_at) VALUES (?, ?, ?, ?, ?, ?, ?)", row)
+                for row in qubit_rows
+            ]
+            for i in range(0, len(statements), BATCH):
+                execute_batch(statements[i:i + BATCH])
+        if pair_rows:
+            statements = [
+                ("INSERT OR IGNORE INTO pair_snapshots (device_name, qubit1, qubit2, gate_name, "
+                 "property_name, value, unit, vendor_measured_at, polled_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+                for row in pair_rows
+            ]
+            for i in range(0, len(statements), BATCH):
+                execute_batch(statements[i:i + BATCH])
+
+        if qubit_rows or pair_rows:
+            print(f"  [Turso] wrote {len(qubit_rows)} qubit, {len(pair_rows)} pair rows.")
+    except Exception as e:
+        print(f"  [Turso] qubit/pair write failed: {e}", file=sys.stderr)
+
+
 def collect() -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] Starting multi-provider snapshot...")
+
+    ts = datetime.now(timezone.utc).isoformat()
 
     all_rows = []
     all_rows += collect_ibm()
@@ -888,8 +998,8 @@ def collect() -> None:
         _write_csv(rows)
         print(f"[{datetime.now(timezone.utc).isoformat()}] "
               f"Wrote {len(rows)} rows to {CSV_PATH}")
+        _write_turso(rows, ts)
     else:
-        ts = datetime.now(timezone.utc).isoformat()
         n_alerts = _check_and_write_alerts(rows, ts)
         _save_snapshots(rows)
         print(f"[{datetime.now(timezone.utc).isoformat()}] "
@@ -897,6 +1007,8 @@ def collect() -> None:
               f"{len([r for r in rows if r.get('provider','')=='ionq'])} IonQ, "
               f"{len([r for r in rows if 'braket' in r.get('provider','')])} Braket)"
               + (f" | {n_alerts} drift alert(s)" if n_alerts else ""))
+        _write_turso(rows, ts)
+        _write_turso_qubit_pair(ts)
 
 
 if __name__ == "__main__":
