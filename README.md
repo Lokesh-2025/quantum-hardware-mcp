@@ -77,9 +77,10 @@ graph TD
     end
 
     subgraph Observability Plane
-        Snapshot["snapshot.py\nRuns every 2h"]
+        Snapshot["snapshot.py\nLocal LaunchAgent every 6h +\nGitHub Actions every 2h"]
         DB["devices.db\nSQLite — local history"]
         CSV["data/snapshots.csv\nPublic — GitHub Actions CI"]
+        Turso[("Turso\nShared, live, laptop-independent\nsame database quantum-verifier uses")]
         Jobs["job_submissions\nAgentic workload log"]
         Report["report.py\nDaily fleet report"]
         Alerts["Calibration drift alerts\nCX / readout / T1 / T2"]
@@ -95,9 +96,11 @@ graph TD
     MCP --> BraketAPI
     Snapshot --> DB
     Snapshot --> CSV
+    Snapshot --> Turso
     Snapshot --> Alerts
     MCP --> Jobs
     DB --> MCP
+    Turso -.->|live read, no sync needed| Alerts
     Jobs --> MCP
     Report --> DB
 ```
@@ -204,7 +207,7 @@ rest of the server still runs if it is missing.
 | `circuit_report` | Full dry-run: gate counts, qubit mapping, per-pair CX errors, estimated fidelity |
 | `estimate_runtime` | QPU minutes + queue wait estimate before you submit |
 | `route_job` | Credit-aware routing — cheapest backend that meets your error threshold |
-| Automatic drift gate (`submit_job`, `ionq_submit_job`) | Before any real submission, both tools automatically check the target device's calibration history for a real alert (error spike >20%, T1/T2 drop, or went offline) in the last 24 hours — no separate `get_alerts` call needed. Blocks by default with `confirm_despite_drift_alert=True` to override, same shape as `confirm_real_hardware`. |
+| Automatic drift gate (`submit_job`, `ionq_submit_job`) | Before any real submission, both tools automatically check the target device's calibration history for a real alert (error spike >20%, T1/T2 drop, or went offline) in the last 24 hours — no separate `get_alerts` call needed. Blocks by default with `confirm_despite_drift_alert=True` to override, same shape as `confirm_real_hardware`. The T1/T2 portion reads live from the shared Turso database (2026-08-30) — this gate no longer only sees drift up to whenever this exact machine last synced. |
 | `check_chip_identity` | Detects a silent hardware swap or qubit relabeling — the physical chip behind a device name changed, or its qubit indices got reassigned, neither of which any public API states directly. Built on a real per-qubit/per-pair calibration archive (`qubit_snapshots`/`pair_snapshots`), backfilled from IBM's own history back to each device's online_date. Verdict is calibrated against real observed correlation-decay-vs-time-gap on `ibm_fez`'s own 831-day history, not a fixed guess. |
 | `verify_stabilizer_circuit` | Exact measurement distribution for any Clifford-only circuit (H, S, CX, CZ, ...) via the stabilizer tableau — not simulated, not estimated, exact, and scales to hundreds of qubits (Gottesman-Knill theorem). Confirmed: a 150-qubit Clifford circuit verifies in under a second, where state-vector simulation would need 2^150 amplitudes and is physically impossible |
 | `verify_stabilizer_hardware_result` | Verifies real hardware measurement counts against a Clifford circuit's exact stabilizer prediction — a real fidelity lower bound at any qubit count, no simulation required |
@@ -239,7 +242,7 @@ rest of the server still runs if it is missing.
 
 | Tool | What it does |
 |------|-------------|
-| `get_alerts` | Calibration drift alerts — spikes >20% in CX error, readout error, T1, or T2 |
+| `get_alerts` | Calibration drift alerts — spikes >20% in CX error, readout error, T1, or T2. The T1/T2 check reads live from the shared Turso database (2026-08-30) when configured, same one `quantum-verifier` uses, so this reflects real current state regardless of whose laptop last synced — falls back to the local db automatically otherwise |
 | `start_repro_experiment` | Run the same circuit N times, record variance across runs |
 | `repro_score` | KL-divergence reproducibility score (0 = identical, 1 = maximally different) |
 | `job_analytics` | Aggregate stats across all logged jobs — transpilation expansion ratios, per-tool breakdown |
@@ -318,7 +321,10 @@ quantum-hardware-mcp/
 ├── tools_chemistry.py             # qforge chemistry tools (7), registered on the same server
 ├── mcp_app.py                     # Shared FastMCP instance, so both sides register on one server
 ├── qforge/                        # Quantum chemistry library — integrals, forging, mitigation
-├── snapshot.py                    # Multi-provider calibration snapshot (every 2h)
+├── snapshot.py                    # Multi-provider calibration snapshot (local every 6h,
+│                                   # GitHub Actions every 2h) — writes local db, CSV, and Turso
+├── turso_db.py                    # Shared Turso database client — live device history,
+│                                   # used by server.py's get_alerts/_recent_drift_alert
 ├── report.py                      # Daily fleet report
 ├── requirements.txt
 ├── docker-compose.yml
@@ -337,6 +343,8 @@ quantum-hardware-mcp/
 │                                   #  private singmasters-conjecture repo — full journey,
 │                                   #  178.8× hardware result, and job IDs live there)
 ├── tests/
+│   ├── conftest.py                 # Session-wide test isolation — blocks real Turso
+│   │                                # access during tests
 │   ├── test_all_tools.py          # Smoke test suite (needs live IBM credentials)
 │   ├── test_server_tools.py       # IBM + IonQ device/job tool tests
 │   ├── test_ionq_canaries.py      # Endianness + angle-unit regression tests (IonQ)
@@ -436,6 +444,7 @@ Restart Claude Desktop. All 53 tools appear under the hammer icon.
 - [x] Per-qubit/per-pair calibration archive — new `qubit_snapshots`/`pair_snapshots` tables, backfilled real per-qubit T1/T2/readout-error and per-pair gate-error history for `ibm_fez` back to its 2024-05-14 online_date (662,691 real qubit rows, 741,420 real pair rows, 831 days, 0 errors), plus a compressed raw-JSON archive per real update event so a future parsing bug is retroactively fixable, not history-destroying (the exact class of bug that caused the IonQ null-data incident above). Confirmed live: IBM's `backend.properties(datetime=...)` supports full historical backfill with no retention cutoff — the boundary found was exactly the device's own online_date, not an API limit. IBM does not expose per-qubit frequency for current-generation Heron devices (confirmed empty via `qubit_properties()` on `ibm_fez`) — noted honestly wherever this data would ideally have been used. Initially a one-time backfill only — fixed the same day after checking: `collect_ibm()` now feeds this same archive from the live `properties()` call it already makes every regular collection cycle (local LaunchAgent only, matching where `devices.db` already lives), so it keeps growing on its own going forward instead of going stale.
 - [x] `check_chip_identity` — first real tool built on the per-qubit archive: detects a silent hardware swap (device name unchanged, physical chip changed) or qubit relabeling, via real per-qubit fingerprint correlation. Verdict is calibrated against `ibm_fez`'s own real 831-day history (a fixed threshold produced a false "possible relabeling" alarm at a 700-day comparison gap during testing — real correlation naturally decays with gap length even on unchanged hardware, so the check now compares against real gap-appropriate expectations instead), averages 3 nearby reference points to cut single-comparison noise (also found empirically — a single comparison is genuinely noisy even on healthy hardware), and refuses comparisons that fall within 60 days of a device's online_date after finding a real correlation cliff there in bring-up-era data.
 - [x] Two real bugs found and fixed, reported by a real external user (Venkat Allu's [quantum-chemistry-vqe](https://github.com/Venkatallu11/quantum-chemistry-vqe), which is independently built on this project's MCP server for device selection): (1) `best_qubits` used to pick the top-n qubits by individual score alone, only warning after the fact if they happened not to be connected — confirmed live and reproducible against real `ibm_fez` before the fix (`best_qubits('ibm_fez', n=8)` returned 8 qubits with **zero** real connections between them). Now actually searches for a connected subset via greedy expansion from multiple top-scored seeds, only falling back to the old warn-only behavior when no connected subset of the requested size exists at all. (2) `compare_devices` used to collapse IBM's real status message down to `"online"/"offline"` based on `operational` alone, which isn't a reliable enough signal on its own — a device could rank #1 while actually unavailable, leaving a submitted job stuck queued indefinitely with no explanation. Now keeps the real status message and excludes anything that isn't genuinely `"active"` from ranking, reporting it separately in a new `unavailable_devices` field instead. 12 new tests (6 per fix), including a direct reproduction of the real reported bug scenario for each.
+- [x] **Shared, live Turso database, so drift detection stops depending on any one machine's laptop being on (2026-08-30).** Both `get_alerts`'s T1/T2 check and `_recent_drift_alert` (the real gate `submit_job`/`ionq_submit_job` check before spending real money — the exact "ibm_boston wasn't recalibrated and nobody knew for 5 hours" scenario this project exists to catch) now read live from a shared Turso database via `turso_db.py`, falling back to the local db automatically when Turso isn't configured. Both the 6-hour local LaunchAgent and the 2-hour GitHub Actions collector now write into it. Same database `quantum-verifier` uses — migrated this repo's own 5,990 device rows (2022-01-07 onward), 24,439 qubit rows, and 14,492 pair rows into it as the seed. Scoped to `provider in ('ibm', 'ionq')` — `braket/*` rows (a different access path to overlapping hardware, only ~2 months deep) deliberately excluded from the shared table. `device_history`/`device_profile` were **not** converted — Turso's shared schema is narrower than this repo's local one (missing native gate set, CLOPS, quantum volume, etc.), so redirecting those would lose data, not gain freshness. `device_alerts` (stored cx/readout-spike/went-offline alerts) also stays local-only for now, not yet mirrored to Turso — flagged, not silently done. Found and fixed a real bug along the way: the `libsql_client` package's sync wrapper leaves a background thread that doesn't reliably terminate on process exit (confirmed directly — hangs 90s+ even with `.close()` registered via `atexit`); replaced with a plain `requests`-based HTTP client (`turso_db.py`) instead.
 
 **Next**
 - [ ] Web interface — visual frontend for device comparison, job submission, circuit playground, live results (in progress: quantum-hardware-web)
@@ -446,6 +455,8 @@ Restart Claude Desktop. All 53 tools appear under the hammer icon.
 - [ ] Quantum Rush Hour detection — weekly queue seasonality
 - [ ] Smart routing brain — cross-provider ML recommendations
 - [ ] Publication package generator — job ID → figures + BibTeX + methods section
+- [ ] Mirror `device_alerts` (stored cx/readout-error-spike and went-offline alerts) to the shared Turso database — currently only the live T1/T2 check reads from Turso; these stay local-only, written only by the local collection branch
+- [ ] `check_chip_identity`'s per-qubit fingerprinting still reads local-only — same class of gap the T1/T2 drift check had before the Turso work above, not yet converted (bigger rewrite, cursor-based across multiple queries — flagged, not silently skipped)
 
 ---
 
