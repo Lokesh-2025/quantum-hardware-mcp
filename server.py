@@ -829,49 +829,27 @@ def device_history(device_name: str, days: int = 7) -> str:
     when it was recorded (error rates are NULL when the recording tool
     didn't fetch calibration data).
     """
-    with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT ts, num_qubits, operational, pending_jobs,
-                   avg_cx_error, avg_readout_error,
-                   median_t1_us, median_t2_us, qubit_yield_fraction,
-                   day_of_week, hour_utc,
-                   processor_family, backend_version, last_calibration_dt,
-                   clops_h, quantum_volume, avg_2q_gate_duration_ns,
-                   avg_prob_meas0_prep1, avg_prob_meas1_prep0
-            FROM   device_snapshots
-            WHERE  name = ?
-              AND  ts >= datetime('now', ? || ' days')
-            ORDER  BY ts ASC
-            """,
-            (device_name, f"-{days}"),
-        ).fetchall()
+    cols = ["ts", "num_qubits", "operational", "pending_jobs",
+            "avg_cx_error", "avg_readout_error",
+            "median_t1_us", "median_t2_us", "qubit_yield_fraction",
+            "day_of_week", "hour_utc",
+            "processor_family", "backend_version", "last_calibration_dt",
+            "clops_h", "quantum_volume", "avg_2q_gate_duration_ns",
+            "avg_prob_meas0_prep1", "avg_prob_meas1_prep0"]
+    rows = _run_query(
+        f"""
+        SELECT {", ".join(cols)}
+        FROM   device_snapshots
+        WHERE  name = ?
+          AND  ts >= datetime('now', ? || ' days')
+        ORDER  BY ts ASC
+        """,
+        (device_name, f"-{days}"),
+    )
 
-    snapshots = [
-        {
-            "ts":                  r["ts"],
-            "num_qubits":          r["num_qubits"],
-            "operational":         bool(r["operational"]) if r["operational"] is not None else None,
-            "pending_jobs":        r["pending_jobs"],
-            "avg_cx_error":        r["avg_cx_error"],
-            "avg_readout_error":   r["avg_readout_error"],
-            "median_t1_us":             r["median_t1_us"],
-            "median_t2_us":             r["median_t2_us"],
-            "qubit_yield_fraction":     r["qubit_yield_fraction"],
-            "day_of_week":              r["day_of_week"],
-            "hour_utc":                 r["hour_utc"],
-            "processor_family":         r["processor_family"],
-            "backend_version":          r["backend_version"],
-            "last_calibration_dt":      r["last_calibration_dt"],
-            "clops_h":                  r["clops_h"],
-            "quantum_volume":           r["quantum_volume"],
-            "avg_2q_gate_duration_ns":  r["avg_2q_gate_duration_ns"],
-            "avg_prob_meas0_prep1":     r["avg_prob_meas0_prep1"],
-            "avg_prob_meas1_prep0":     r["avg_prob_meas1_prep0"],
-        }
-        for r in rows
-    ]
+    snapshots = [dict(zip(cols, r)) for r in rows]
+    for s in snapshots:
+        s["operational"] = bool(s["operational"]) if s["operational"] is not None else None
 
     return json.dumps(
         {"device": device_name, "days": days, "snapshots": snapshots},
@@ -898,31 +876,32 @@ def device_profile(device_name: str) -> str:
 
     Returns a JSON object with every collected field for that device.
     """
-    with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        row = con.execute(
-            """
-            SELECT ts, provider, name, num_qubits, operational, pending_jobs,
-                   avg_cx_error, avg_readout_error,
-                   median_t1_us, median_t2_us, qubit_yield_fraction,
-                   native_gate_set, coupling_map_edges, connectivity_density,
-                   max_shots, max_experiments,
-                   processor_family, backend_version, online_date,
-                   last_calibration_dt, dt_ns,
-                   avg_2q_gate_duration_ns, avg_readout_length_ns,
-                   avg_prob_meas0_prep1, avg_prob_meas1_prep0,
-                   rep_delay_default_ms, clops_h, quantum_volume
-            FROM   device_snapshots
-            WHERE  name = ?
-            ORDER  BY ts DESC
-            LIMIT  1
-            """,
-            (device_name,),
-        ).fetchone()
+    cols = ["ts", "provider", "name", "num_qubits", "operational", "pending_jobs",
+            "avg_cx_error", "avg_readout_error",
+            "median_t1_us", "median_t2_us", "qubit_yield_fraction",
+            "native_gate_set", "coupling_map_edges", "connectivity_density",
+            "max_shots", "max_experiments",
+            "processor_family", "backend_version", "online_date",
+            "last_calibration_dt", "dt_ns",
+            "avg_2q_gate_duration_ns", "avg_readout_length_ns",
+            "avg_prob_meas0_prep1", "avg_prob_meas1_prep0",
+            "rep_delay_default_ms", "clops_h", "quantum_volume"]
+    rows = _run_query(
+        f"""
+        SELECT {", ".join(cols)}
+        FROM   device_snapshots
+        WHERE  name = ?
+        ORDER  BY ts DESC
+        LIMIT  1
+        """,
+        (device_name,),
+    )
 
-    if row is None:
+    if not rows:
         return json.dumps({"error": f"No snapshot found for '{device_name}'. "
                            "Run list_devices to see available backends."})
+
+    row = dict(zip(cols, rows[0]))
 
     profile = {
         "device":               row["name"],
@@ -986,18 +965,18 @@ def device_on_date(device_name: str, date: str) -> str:
     Returns aggregated stats averaged across all snapshots taken that day
     (snapshots are recorded every 6 hours by the background agent).
     """
-    with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT ts, operational, pending_jobs, avg_cx_error, avg_readout_error
-            FROM   device_snapshots
-            WHERE  name   = ?
-              AND  date(ts) = ?
-            ORDER  BY ts ASC
-            """,
-            (device_name, date),
-        ).fetchall()
+    cols = ["ts", "operational", "pending_jobs", "avg_cx_error", "avg_readout_error"]
+    rows = _run_query(
+        f"""
+        SELECT {", ".join(cols)}
+        FROM   device_snapshots
+        WHERE  name   = ?
+          AND  date(ts) = ?
+        ORDER  BY ts ASC
+        """,
+        (device_name, date),
+    )
+    rows = [dict(zip(cols, r)) for r in rows]
 
     if not rows:
         return json.dumps({
@@ -1008,7 +987,7 @@ def device_on_date(device_name: str, date: str) -> str:
                       "Snapshots are recorded every 6 hours by the local LaunchAgent.",
         })
 
-    snapshots = [dict(r) for r in rows]
+    snapshots = rows  # already dicts, via _run_query() + zip(cols, ...) above
 
     def _avg(field: str):
         vals = [s[field] for s in snapshots if s[field] is not None]
@@ -3209,46 +3188,50 @@ def _qubit_fingerprint_vector(device_name: str, as_of: str = None) -> dict:
     readout/gate-error patterns are real but noisier day-to-day than
     frequency would be, so this check has real but weaker statistical
     power than a frequency-based version would have had.
+
+    Reads via _run_query() (added 2026-08-31) -- Turso-first (live,
+    686k+/754k+ rows migrated from this repo's own deep local archive),
+    local-db fallback otherwise. Previously local-only, same class of gap
+    get_alerts had before its own Turso conversion -- flagged in this
+    repo's README as a known gap, closed here.
     """
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cutoff = as_of or "9999-12-31"
+    cutoff = as_of or "9999-12-31"
 
-        qubit_vals = {}
-        for prop in ("T1", "T2", "readout_error"):
-            rows = cur.execute(
-                """
-                SELECT qubit_index, value FROM qubit_snapshots
-                WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
-                AND id IN (
-                    SELECT MAX(id) FROM qubit_snapshots
-                    WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
-                    GROUP BY qubit_index
-                )
-                """,
-                (device_name, prop, cutoff, device_name, prop, cutoff),
-            ).fetchall()
-            for qi, val in rows:
-                qubit_vals.setdefault(qi, {})[prop.lower()] = val
-
-        gate_rows = cur.execute(
+    qubit_vals = {}
+    for prop in ("T1", "T2", "readout_error"):
+        rows = _run_query(
             """
-            SELECT qubit1, qubit2, value FROM pair_snapshots
-            WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+            SELECT qubit_index, value FROM qubit_snapshots
+            WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
             AND id IN (
-                SELECT MAX(id) FROM pair_snapshots
-                WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
-                GROUP BY qubit1, qubit2
+                SELECT MAX(id) FROM qubit_snapshots
+                WHERE device_name = ? AND property_name = ? AND vendor_measured_at <= ?
+                GROUP BY qubit_index
             )
             """,
-            (device_name, cutoff, device_name, cutoff),
-        ).fetchall()
-        gate_errors_by_qubit = {}
-        for q1, q2, val in gate_rows:
-            gate_errors_by_qubit.setdefault(q1, []).append(val)
-            gate_errors_by_qubit.setdefault(q2, []).append(val)
-        for qi, errs in gate_errors_by_qubit.items():
-            qubit_vals.setdefault(qi, {})["avg_gate_error"] = sum(errs) / len(errs)
+            (device_name, prop, cutoff, device_name, prop, cutoff),
+        )
+        for qi, val in rows:
+            qubit_vals.setdefault(qi, {})[prop.lower()] = val
+
+    gate_rows = _run_query(
+        """
+        SELECT qubit1, qubit2, value FROM pair_snapshots
+        WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+        AND id IN (
+            SELECT MAX(id) FROM pair_snapshots
+            WHERE device_name = ? AND property_name = 'gate_error' AND vendor_measured_at <= ?
+            GROUP BY qubit1, qubit2
+        )
+        """,
+        (device_name, cutoff, device_name, cutoff),
+    )
+    gate_errors_by_qubit = {}
+    for q1, q2, val in gate_rows:
+        gate_errors_by_qubit.setdefault(q1, []).append(val)
+        gate_errors_by_qubit.setdefault(q2, []).append(val)
+    for qi, errs in gate_errors_by_qubit.items():
+        qubit_vals.setdefault(qi, {})["avg_gate_error"] = sum(errs) / len(errs)
 
     return qubit_vals
 

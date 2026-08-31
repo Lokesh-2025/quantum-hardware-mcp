@@ -871,12 +871,27 @@ def log_job_result(job_id: str, counts: dict) -> None:
         pass  # never crash the main flow over logging
 
 
+_TURSO_DEVICE_FIELDS = [
+    "ts", "provider", "name", "num_qubits", "operational", "pending_jobs",
+    "avg_cx_error", "avg_readout_error", "median_t1_us", "median_t2_us",
+    "native_gate_set", "coupling_map_edges", "connectivity_density",
+    "qubit_yield_fraction", "max_shots", "day_of_week", "hour_utc",
+    "processor_family", "backend_version", "online_date",
+    "last_calibration_dt", "dt_ns", "avg_2q_gate_duration_ns",
+    "avg_readout_length_ns", "avg_prob_meas0_prep1", "avg_prob_meas1_prep0",
+    "rep_delay_default_ms", "clops_h", "max_experiments", "quantum_volume",
+]
+
+
 def _write_turso(rows: list[dict], ts: str) -> None:
     """
-    Added 2026-08-30: writes device-level rows into the shared Turso
-    database (same one quantum-verifier uses) so get_alerts()/
-    device_history()/device_on_date() can read live, current data
-    regardless of whose laptop last ran a local import.
+    Added 2026-08-30, widened to the FULL field set 2026-08-31 (was only
+    10 of the 30 fields this repo actually collects -- narrower than the
+    real local schema, an incomplete first pass, not a Turso limitation).
+    Writes device-level rows into the shared Turso database (same one
+    quantum-verifier uses) so get_alerts()/device_history()/
+    device_on_date() can read live, current data regardless of whose
+    laptop last ran a local import.
 
     Scoped to provider in ('ibm', 'ionq') only, matching the scope
     decision already made on the quantum-verifier side: 'braket/*' rows
@@ -904,21 +919,47 @@ def _write_turso(rows: list[dict], ts: str) -> None:
     if not device_rows:
         return
 
+    now = datetime.now(timezone.utc)
+    day_of_week, hour_utc = now.weekday(), now.hour
+
     try:
-        statements = [
-            ("INSERT INTO device_snapshots (ts, provider, name, num_qubits, operational, "
-             "pending_jobs, avg_cx_error, avg_readout_error, median_t1_us, median_t2_us) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-             (ts, r.get("provider", "ibm"), r["name"], r.get("num_qubits"),
-              int(r["operational"]) if r.get("operational") is not None else None,
-              r.get("pending_jobs"), r.get("avg_cx_error"), r.get("avg_readout_error"),
-              r.get("median_t1_us"), r.get("median_t2_us")))
-            for r in device_rows
-        ]
+        cols_sql = ", ".join(_TURSO_DEVICE_FIELDS)
+        placeholders = ", ".join("?" for _ in _TURSO_DEVICE_FIELDS)
+        statements = []
+        for r in device_rows:
+            values = {
+                "ts": ts, "provider": r.get("provider", "ibm"), "name": r["name"],
+                "num_qubits": r.get("num_qubits"),
+                "operational": int(r["operational"]) if r.get("operational") is not None else None,
+                "pending_jobs": r.get("pending_jobs"),
+                "avg_cx_error": r.get("avg_cx_error"), "avg_readout_error": r.get("avg_readout_error"),
+                "median_t1_us": r.get("median_t1_us"), "median_t2_us": r.get("median_t2_us"),
+                "native_gate_set": r.get("native_gate_set"),
+                "coupling_map_edges": r.get("coupling_map_edges"),
+                "connectivity_density": r.get("connectivity_density"),
+                "qubit_yield_fraction": r.get("qubit_yield_fraction"),
+                "max_shots": r.get("max_shots"),
+                "day_of_week": day_of_week, "hour_utc": hour_utc,
+                "processor_family": r.get("processor_family"),
+                "backend_version": r.get("backend_version"),
+                "online_date": r.get("online_date"),
+                "last_calibration_dt": r.get("last_calibration_dt"),
+                "dt_ns": r.get("dt_ns"),
+                "avg_2q_gate_duration_ns": r.get("avg_2q_gate_duration_ns"),
+                "avg_readout_length_ns": r.get("avg_readout_length_ns"),
+                "avg_prob_meas0_prep1": r.get("avg_prob_meas0_prep1"),
+                "avg_prob_meas1_prep0": r.get("avg_prob_meas1_prep0"),
+                "rep_delay_default_ms": r.get("rep_delay_default_ms"),
+                "clops_h": r.get("clops_h"), "max_experiments": r.get("max_experiments"),
+                "quantum_volume": r.get("quantum_volume"),
+            }
+            statements.append((f"INSERT INTO device_snapshots ({cols_sql}) VALUES ({placeholders})",
+                                tuple(values[f] for f in _TURSO_DEVICE_FIELDS)))
+
         BATCH = 500
         for i in range(0, len(statements), BATCH):
             execute_batch(statements[i:i + BATCH])
-        print(f"  [Turso] wrote {len(device_rows)} device rows — live for anyone running the tool now.")
+        print(f"  [Turso] wrote {len(device_rows)} device rows (full field set) — live for anyone running the tool now.")
     except Exception as e:
         print(f"  [Turso] write failed (local/CSV save already succeeded): {e}", file=sys.stderr)
 
