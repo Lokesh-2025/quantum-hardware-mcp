@@ -4,6 +4,8 @@ A quantum hardware orchestration and intelligence layer that gives AI agents the
 
 Built in collaboration with [Jack Woehr](https://github.com/jwoehr) — IBM Quantum veteran, Qiskit contributor.
 
+**Related project:** [qem-auditor](https://github.com/Venkatallu11/qem-auditor) by Venkat Allu (a real external contributor to this repo — see the Roadmap for the two bugs he found and fixed) — an independent auditor for quantum error-mitigation claims, built on the companion [quantum-verifier](https://github.com/Lokesh-2025/quantum-verifier) project's `falsify_claim` control-experiment idea.
+
 ---
 
 ## Why this exists
